@@ -1,65 +1,58 @@
 import asyncio
-import asyncpg
-
+import logging
 from aiogram import Bot, Dispatcher
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from contextlib import asynccontextmanager
 
-from bot.config import BOT_TOKEN, DATABASE_URL
-from bot.db.base import engine, Base
-from bot.db import models  
+from bot.config import config
+from bot.handlers import user, admin
+from bot.db.base import create_engine_and_session
 
-from bot.handlers.start import router as start_router
-from bot.handlers.payments import payments_router 
-from bot.handlers.admin_payments import admin_payments_router
-from bot.handlers.admin import admin_router  
-
-from bot.services.scheduler import subscription_watcher
-from bot.config import DATABASE_URL_ASYNCPG
-
-async def wait_for_db(url):
-    for i in range(30):
-        try:
-            print(f"Waiting for DB... ({i+1}/30)")
-            conn = await asyncpg.connect(url)
-            await conn.close()
-            print("DB is ready")
-            return
-        except Exception as e:
-            await asyncio.sleep(2)
-
-    raise RuntimeError("Database is not available")
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    print("DB initialized")
+class BotWithDB(Bot):
+    """Кастомный бот с доступом к сессии БД"""
+    def __init__(self, *args, session_maker, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session_maker = session_maker
+    
+    @asynccontextmanager
+    async def get_db_session(self):
+        """Получить сессию БД (контекстный менеджер)"""
+        async with self.session_maker() as session:
+            try:
+                yield session
+            finally:
+                await session.close()
 
 
 async def main():
-    print("BOT TOKEN =", BOT_TOKEN)
-
-    await wait_for_db(DATABASE_URL_ASYNCPG)
-    await init_db()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    # Настройка базы данных
+    engine, async_session_maker = create_engine_and_session(config.DATABASE_URL)
+    
+    # Создаем бота
+    bot = BotWithDB(
+        token=config.BOT_TOKEN,
+        session_maker=async_session_maker
     )
-
-    asyncio.create_task(subscription_watcher(bot))
-
-    dp = Dispatcher()
-
-    dp.include_router(start_router)
-    dp.include_router(payments_router)
-    dp.include_router(admin_payments_router)
-    dp.include_router(admin_router)
-
-    print("Bot started, polling...")
-    await dp.start_polling(bot)
+    
+    # Создаем диспетчер
+    dp = Dispatcher(storage=MemoryStorage())
+    
+    # Регистрируем роутеры
+    dp.include_router(user.router)
+    dp.include_router(admin.router)
+    
+    # Запускаем бота
+    logger.info("Бот запущен!")
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await engine.dispose()
 
 
 if __name__ == "__main__":

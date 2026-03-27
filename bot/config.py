@@ -1,24 +1,38 @@
-from dotenv import load_dotenv
 import os
+from dataclasses import dataclass, field
+from typing import List
+from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+@dataclass
+class Config:
+    # Токен бота
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    
+    # ID админа (можно несколько через запятую)
+    ADMIN_IDS: List[int] = field(default_factory=lambda: [
+        int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()
+    ])
+    
+    # Настройки базы данных
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
+    
+    # Настройки подписки
+    SUBSCRIPTION_PRICE: int = int(os.getenv("SUBSCRIPTION_PRICE", "1000"))
+    SUBSCRIPTION_DAYS: int = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
+    
+    # Настройки напоминаний
+    REMINDER_DAYS_BEFORE: int = int(os.getenv("REMINDER_DAYS_BEFORE", "3"))
+    
+    # Карта для оплаты
+    CARD_NUMBER: str = os.getenv("CARD_NUMBER", "")
+    CARD_HOLDER: str = os.getenv("CARD_HOLDER", "")
+    
+    # Инструкции
+    AMNESIA_DOWNLOAD_LINK: str = os.getenv("AMNESIA_DOWNLOAD_LINK", "")
+    TUNNEL_INSTRUCTION: str = os.getenv("TUNNEL_INSTRUCTION", "")
 
-DATABASE_URL = (
-    f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}"
-    f"@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-)
 
-DATABASE_URL_ASYNCPG = os.getenv("DATABASE_URL_ASYNCPG")
-
-
-def is_admin(telegram_id: int) -> bool:
-    return telegram_id == ADMIN_ID
+config = Config()

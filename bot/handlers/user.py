@@ -1,0 +1,205 @@
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from datetime import datetime
+
+from bot.db import crud
+from bot.keyboards.keyboards import get_main_keyboard, get_payment_keyboard, get_question_keyboard, get_admin_keyboard
+from bot.config import config
+
+router = Router()
+
+# Состояния для FSM
+class PaymentState(StatesGroup):
+    waiting_for_payment_confirmation = State()
+
+
+class QuestionState(StatesGroup):
+    waiting_for_question = State()
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """Обработчик команды /start"""
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_or_create_user(
+            session, 
+            message.from_user.id,
+            message.from_user.username
+        )
+        
+        has_subscription = await crud.check_subscription_status(session, user.id)
+        
+        welcome_text = (
+            "👋 Добро пожаловать!\n\n"
+            "Я бот для продажи Amnesia VPN.\n\n"
+            f"💰 Цена подписки: {config.SUBSCRIPTION_PRICE}₽/месяц\n\n"
+            "📌 Для покупки нажмите кнопку 'Купить подписку'\n"
+            "❓ Если есть вопросы - кнопка 'Задать вопрос'\n"
+            "ℹ️ Для проверки статуса - 'Моя подписка'"
+        )
+        
+        await message.answer(
+            welcome_text,
+            reply_markup=get_main_keyboard()
+        )
+        
+        if has_subscription:
+            await message.answer("✅ У вас есть активная подписка!")
+
+
+@router.message(F.text == "📦 Купить подписку")
+async def buy_subscription(message: Message):
+    """Покупка подписки"""
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Ошибка! Попробуйте /start")
+            return
+        
+        has_subscription = await crud.check_subscription_status(session, user.id)
+        
+        if has_subscription:
+            subscription = await crud.get_user_subscription(session, user.id)
+            days_left = (subscription.next_payment - datetime.now()).days
+            await message.answer(
+                f"✅ У вас уже есть активная подписка!\n"
+                f"Осталось дней: {days_left}\n\n"
+                f"Вы можете продлить подписку в любой момент."
+            )
+            return
+        
+        price_info = (
+            f"💰 Стоимость подписки: {config.SUBSCRIPTION_PRICE}₽\n\n"
+            f"📥 Скачать Amnesia: {config.AMNESIA_DOWNLOAD_LINK}\n\n"
+            f"🔧 Инструкция по настройке туннеля:\n{config.TUNNEL_INSTRUCTION}\n\n"
+            f"💳 Оплата:\n"
+            f"Карта: {config.CARD_NUMBER}\n"
+            f"Получатель: {config.CARD_HOLDER}\n\n"
+            f"❗️ После оплаты нажмите кнопку 'Я оплатил(а)'"
+        )
+        
+        await message.answer(
+            price_info,
+            reply_markup=get_payment_keyboard()
+        )
+
+
+@router.callback_query(F.data == "payment_confirmed")
+async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
+    """Пользователь подтвердил оплату"""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    
+    async with callback.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
+        if user:
+            payment = await crud.create_payment(session, user.id, status="pending")
+            await state.update_data(payment_id=payment.id)
+    
+    await callback.message.answer(
+        "✅ Спасибо! Я отправил уведомление администратору.\n"
+        "Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
+    )
+    
+    for admin_id in config.ADMIN_IDS:
+        await callback.bot.send_message(
+            admin_id,
+            f"💰 Новый платеж!\n\n"
+            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+            f"ID: {callback.from_user.id}\n"
+            f"Сумма: {config.SUBSCRIPTION_PRICE}₽\n\n"
+            f"Проверьте банк и подтвердите оплату.",
+            reply_markup=get_admin_keyboard(callback.from_user.id)
+        )
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data == "payment_cancel")
+async def payment_cancel(callback: CallbackQuery):
+    """Отмена оплаты"""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Оплата отменена.")
+    await callback.answer()
+
+
+@router.message(F.text == "❓ Задать вопрос")
+async def ask_question(message: Message, state: FSMContext):
+    """Начать процесс задавания вопроса"""
+    await message.answer(
+        "📝 Напишите ваш вопрос.\n"
+        "Администратор ответит вам в ближайшее время.\n\n"
+        "Для отмены отправьте /cancel",
+        reply_markup=get_question_keyboard()
+    )
+    await state.set_state(QuestionState.waiting_for_question)
+
+
+@router.callback_query(F.data == "question_cancel")
+async def question_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Вопрос отменен")
+    await callback.answer()
+
+
+@router.message(QuestionState.waiting_for_question)
+async def process_question(message: Message, state: FSMContext):
+    """Обработка вопроса"""
+    question_text = message.text
+    
+    for admin_id in config.ADMIN_IDS:
+        await message.bot.send_message(
+            admin_id,
+            f"❓ Новый вопрос от пользователя!\n\n"
+            f"От: @{message.from_user.username or message.from_user.id}\n"
+            f"ID: {message.from_user.id}\n\n"
+            f"Вопрос:\n{question_text}\n\n"
+            f"Для ответа используйте:\n/answer {message.from_user.id} [текст ответа]"
+        )
+    
+    await message.answer(
+        "✅ Ваш вопрос отправлен администратору!\n"
+        "Ответ придет в этот чат."
+    )
+    
+    await state.clear()
+
+
+@router.message(F.text == "ℹ️ Моя подписка")
+async def check_subscription(message: Message):
+    """Проверка статуса подписки"""
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Ошибка! Попробуйте /start")
+            return
+        
+        has_subscription = await crud.check_subscription_status(session, user.id)
+        
+        if has_subscription:
+            subscription = await crud.get_user_subscription(session, user.id)
+            days_left = (subscription.next_payment - datetime.now()).days
+            await message.answer(
+                f"✅ Подписка активна!\n\n"
+                f"📅 Следующее списание: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
+                f"⏰ Осталось дней: {days_left}"
+            )
+        else:
+            await message.answer(
+                "❌ У вас нет активной подписки.\n\n"
+                "Для покупки нажмите кнопку 'Купить подписку'"
+            )
+
+
+@router.message(Command("cancel"))
+async def cancel_handler(message: Message, state: FSMContext):
+    """Отмена текущего действия"""
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    
+    await state.clear()
+    await message.answer("✅ Действие отменено.")
