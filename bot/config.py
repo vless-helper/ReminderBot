@@ -26,6 +26,13 @@ class Config:
     # Настройки напоминаний
     REMINDER_DAYS_BEFORE: int = int(os.getenv("REMINDER_DAYS_BEFORE", "3"))
     
+    # За сколько дней напоминать
+    REMINDER_DAYS: List[int] = field(default_factory=lambda: [3, 1])   
+
+    # Диапазон часов для отправки уведомлений
+    REMINDER_START_HOUR: int = 7
+    REMINDER_END_HOUR: int = 21
+
     # Карта для оплаты
     CARD_NUMBER: str = os.getenv("CARD_NUMBER", "")
     CARD_HOLDER: str = os.getenv("CARD_HOLDER", "")

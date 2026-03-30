@@ -94,3 +94,63 @@ async def reject_payment(callback: CallbackQuery):
             "❌ Ваша оплата не подтверждена.\n"
             "Пожалуйста, свяжитесь с администратором для уточнения деталей."
         )
+
+
+#Тесты
+
+@router.message(Command("check_reminders"))
+async def check_reminders_now(message: Message):
+    """Принудительная проверка напоминаний (только админ)"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав")
+        return
+    
+    await message.answer("🔄 Проверяю напоминания...")
+    
+    # Импортируем функцию проверки
+    from bot.reminder import check_and_send_reminders
+    
+    try:
+        await check_and_send_reminders(message.bot)
+        await message.answer("✅ Проверка напоминаний выполнена!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@router.message(Command("reset_reminder"))
+async def reset_reminder_flag(message: Message):
+    """Сбросить флаг напоминания для тестирования"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав")
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "❌ Использование: /reset_reminder [telegram_id]\n"
+            "Пример: /reset_reminder 123456789"
+        )
+        return
+    
+    try:
+        telegram_id = int(parts[1])
+        
+        async with message.bot.get_db_session() as session:
+            user = await crud.get_user_by_telegram_id(session, telegram_id)
+            if not user:
+                await message.answer(f"❌ Пользователь {telegram_id} не найден")
+                return
+            
+            subscription = await crud.get_user_subscription(session, user.id)
+            if not subscription:
+                await message.answer("❌ У пользователя нет подписки")
+                return
+            
+            await crud.reset_reminder_flag(session, subscription.id)
+            
+            await message.answer(
+                f"✅ Флаг напоминания сброшен для пользователя {telegram_id}\n"
+                f"Следующее напоминание будет отправлено {subscription.next_payment.strftime('%d.%m.%Y')}"
+            )
+            
+    except ValueError:
+        await message.answer("❌ Неверный формат ID")

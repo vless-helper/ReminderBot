@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload 
 from sqlalchemy import select, update, and_
 from typing import Optional, List
 
@@ -113,3 +114,84 @@ async def create_payment(
     await session.commit()
     await session.refresh(payment)
     return payment
+
+
+#Напоминалки 
+
+async def get_expiring_subscriptions(
+    session: AsyncSession, 
+    days_before: int = 3
+) -> List[Subscription]:
+    """Получить подписки, которые истекают через указанное количество дней"""
+    target_date = datetime.now() + timedelta(days=days_before)
+    target_date_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    target_date_end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+    
+    stmt = select(Subscription).options(
+        selectinload(Subscription.user)
+    ).where(
+        and_(
+            Subscription.status == "active",
+            Subscription.next_payment.between(target_date_start, target_date_end),
+            Subscription.last_reminder_sent.is_(None)
+        )
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def get_expiring_tomorrow_subscriptions(session: AsyncSession) -> List[Subscription]:
+    """Получить подписки, которые истекают завтра"""
+    tomorrow = datetime.now().date() + timedelta(days=1)
+    start_of_tomorrow = datetime.combine(tomorrow, datetime.min.time())
+    end_of_tomorrow = datetime.combine(tomorrow, datetime.max.time())
+    
+    stmt = select(Subscription).options(
+        selectinload(Subscription.user)
+    ).where(
+        and_(
+            Subscription.status == "active",
+            Subscription.next_payment.between(start_of_tomorrow, end_of_tomorrow),
+            Subscription.last_reminder_sent.is_(None)  # не отправляли напоминание
+        )
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def get_expired_today_subscriptions(session: AsyncSession) -> List[Subscription]:
+    """Получить подписки, истекшие сегодня"""
+    today = datetime.now().date()
+    start_of_day = datetime.combine(today, datetime.min.time())
+    end_of_day = datetime.combine(today, datetime.max.time())
+    
+    stmt = select(Subscription).options(
+        selectinload(Subscription.user)
+    ).where(
+        and_(
+            Subscription.status == "active",
+            Subscription.next_payment.between(start_of_day, end_of_day)
+        )
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def mark_reminder_sent(session: AsyncSession, subscription_id: int):
+    """Отметить, что напоминание отправлено"""
+    stmt = (
+        update(Subscription)
+        .where(Subscription.id == subscription_id)
+        .values(last_reminder_sent=datetime.now())
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def reset_reminder_flag(session: AsyncSession, subscription_id: int):
+    """Сбросить флаг напоминания (для тестирования)"""
+    stmt = (
+        update(Subscription)
+        .where(Subscription.id == subscription_id)
+        .values(last_reminder_sent=None)
+    )
+    await session.execute(stmt)
+    await session.commit()
