@@ -26,7 +26,7 @@ async def send_reminder_3days(bot: Bot, subscription, days_left: int):
         await bot.send_message(
             subscription.user.telegram_id,
             f"⚠️ Напоминание!\n\n"
-            f"Ваша подписка истекает через {days_left} дня(ей).\n"
+            f"Ваша подписка истекает через {days_left + 1} дня(ей).\n"
             f"Дата окончания: {subscription.next_payment.strftime('%d.%m.%Y')}\n\n"
             f"Пожалуйста, продлите подписку, чтобы не потерять доступ.\n\n"
             f"Для продления нажмите /start"

@@ -1,12 +1,12 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 
 from bot.config import config
 from bot.db import crud
 
 router = Router()
-
 
 @router.message(Command("answer"))
 async def answer_question(message: Message):
@@ -93,6 +93,93 @@ async def reject_payment(callback: CallbackQuery):
             user_id,
             "❌ Ваша оплата не подтверждена.\n"
             "Пожалуйста, свяжитесь с администратором для уточнения деталей."
+        )
+
+
+@router.callback_query(F.data.startswith("extend_"))
+async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
+    """Выбрано количество месяцев для продления"""
+    months = int(callback.data.split("_")[2])
+    
+    # Рассчитываем сумму
+    if months == 1:
+        amount = config.SUBSCRIPTION_PRICE
+    elif months == 3:
+        amount = int(config.SUBSCRIPTION_PRICE * 2.7)  # 2700
+    elif months == 6:
+        amount = int(config.SUBSCRIPTION_PRICE * 5)    # 5000
+    elif months == 12:
+        amount = int(config.SUBSCRIPTION_PRICE * 9)    # 9000
+    else:
+        amount = config.SUBSCRIPTION_PRICE * months
+    
+    await callback.message.edit_reply_markup(reply_markup=None)
+    
+    async with callback.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
+        if user:
+            payment = await crud.create_payment(session, user.id, status="pending", amount=amount, months=months)
+            await state.update_data(payment_id=payment.id, months=months, amount=amount)
+    
+    await callback.message.answer(
+        f"✅ Спасибо! Вы выбрали продление на {months} месяц(ев).\n"
+        f"Сумма к оплате: {amount}₽\n\n"
+        f"Я отправил уведомление администратору.\n"
+        f"Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
+    )
+    
+    for admin_id in config.ADMIN_IDS:
+        await callback.bot.send_message(
+            admin_id,
+            f"💰 НОВЫЙ ПЛАТЕЖ (ПРОДЛЕНИЕ НА {months} МЕСЯЦЕВ)!\n\n"
+            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+            f"ID: {callback.from_user.id}\n"
+            f"Месяцев: {months}\n"
+            f"Сумма: {amount}₽\n\n"
+            f"Проверьте банк и подтвердите оплату.",
+            reply_markup=get_admin_extend_keyboard(callback.from_user.id, months, amount)
+        )
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("confirm_extend_"))
+async def confirm_extend_payment(callback: CallbackQuery):
+    """Подтверждение оплаты продления"""
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("⛔ У вас нет прав", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    user_id = int(parts[2])
+    months = int(parts[3])
+    amount = int(parts[4])
+    
+    async with callback.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, user_id)
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        # Находим последний платеж
+        payment = await crud.get_last_pending_payment(session, user.id)
+        if payment:
+            await crud.update_payment_status(session, payment.id, "completed")
+        
+        # Продлеваем подписку на количество месяцев
+        await crud.extend_subscription_months(session, user.id, months)
+        
+        await callback.answer(f"✅ Оплата на {months} месяц(ев) подтверждена!", show_alert=True)
+        
+        # Удаляем клавиатуру
+        await callback.message.edit_reply_markup(reply_markup=None)
+        
+        # Уведомляем пользователя
+        await callback.bot.send_message(
+            user_id,
+            f"✅ Ваша оплата подтверждена!\n"
+            f"Подписка продлена на {months} месяц(ев).\n\n"
+            "Спасибо за покупку!"
         )
 
 

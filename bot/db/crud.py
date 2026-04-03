@@ -103,17 +103,55 @@ async def check_subscription_status(session: AsyncSession, user_id: int) -> bool
 async def create_payment(
     session: AsyncSession, 
     user_id: int, 
-    status: str = "pending"
+    status: str = "pending",
+    amount: Optional[int] = None,
+    months: Optional[int] = None
 ) -> Payment:
     """Создать запись о платеже"""
     payment = Payment(
         user_id=user_id,
-        status=status
+        status=status,
+        amount=amount,
+        months=months
     )
     session.add(payment)
     await session.commit()
     await session.refresh(payment)
     return payment
+
+
+async def extend_subscription_months(
+    session: AsyncSession, 
+    user_id: int, 
+    months: int
+) -> Subscription:
+    """Продлить подписку на несколько месяцев"""
+    days = months * 30  # Или config.SUBSCRIPTION_DAYS * months
+    
+    subscription = await get_user_subscription(session, user_id)
+    
+    if subscription:
+        # Если есть активная подписка, продлеваем
+        if subscription.next_payment > datetime.now():
+            subscription.next_payment += timedelta(days=days)
+        else:
+            # Если подписка истекла, начинаем с сегодня
+            subscription.next_payment = datetime.now() + timedelta(days=days)
+        subscription.status = "active"
+        subscription.period_days = days
+    else:
+        # Создаем новую подписку
+        subscription = Subscription(
+            user_id=user_id,
+            next_payment=datetime.now() + timedelta(days=days),
+            status="active",
+            period_days=days
+        )
+        session.add(subscription)
+    
+    await session.commit()
+    await session.refresh(subscription)
+    return subscription
 
 
 #Напоминалки 

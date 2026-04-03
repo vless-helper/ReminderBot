@@ -6,7 +6,7 @@ from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
 
 from bot.db import crud
-from bot.keyboards.keyboards import get_main_keyboard, get_payment_keyboard, get_question_keyboard, get_admin_keyboard
+from bot.keyboards.keyboards import get_main_keyboard, get_payment_keyboard, get_question_keyboard, get_admin_keyboard, get_extend_payment_keyboard
 from bot.config import config
 
 router = Router()
@@ -85,6 +85,58 @@ async def buy_subscription(message: Message):
             price_info,
             reply_markup=get_payment_keyboard()
         )
+
+@router.message(F.text == "🔄 Продлить подписку")
+async def extend_subscription(message: Message):
+    """Продление подписки"""
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Ошибка! Попробуйте /start")
+            return
+        
+        has_subscription = await crud.check_subscription_status(session, user.id)
+        
+        if not has_subscription:
+            await message.answer(
+                "❌ У вас нет активной подписки.\n"
+                "Для покупки нажмите кнопку 'Купить подписку'"
+            )
+            return
+        
+        await message.answer(
+            "📅 Выберите срок продления:",
+            reply_markup=get_extend_payment_keyboard()
+        )
+
+@router.callback_query(F.data == "one-month_payment")
+async def extend_one_month_payment(callback: CallbackQuery, state: FSMContext):
+    """Пользователь продлил подписку на один месяц"""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    
+    async with callback.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
+        if user:
+            payment = await crud.create_payment(session, user.id, status="pending", amount=config.SUBSCRIPTION_PRICE, months=1)
+            await state.update_data(payment_id=payment.id)
+    
+    await callback.message.answer(
+        "✅ Спасибо! Я отправил уведомление администратору.\n"
+        "Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
+    )
+    
+    for admin_id in config.ADMIN_IDS:
+        await callback.bot.send_message(
+            admin_id,
+            f"💰 Новый платеж!\n\n"
+            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+            f"ID: {callback.from_user.id}\n"
+            f"Сумма: {config.SUBSCRIPTION_PRICE}₽\n\n"
+            f"Проверьте банк и подтвердите оплату.",
+            reply_markup=get_admin_keyboard(callback.from_user.id)
+        )
+    
+    await callback.answer()
 
 
 @router.callback_query(F.data == "payment_confirmed")
@@ -181,7 +233,7 @@ async def check_subscription(message: Message):
         
         if has_subscription:
             subscription = await crud.get_user_subscription(session, user.id)
-            days_left = (subscription.next_payment - datetime.now()).days
+            days_left = (subscription.next_payment - datetime.now() + 1).days
             await message.answer(
                 f"✅ Подписка активна!\n\n"
                 f"📅 Следующее списание: {subscription.next_payment.strftime('%d.%m.%Y')}\n"

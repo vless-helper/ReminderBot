@@ -65,6 +65,7 @@ class Payment(Base):
         default=lambda: datetime.now()
     )
     status: Mapped[str] = mapped_column(String(32))
+    amount: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Сумма платежа
+    months: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Количество месяцев
     
-    # Обратная связь
     user: Mapped["User"] = relationship("User", back_populates="payments")
