@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 
 from bot.config import config
 from bot.db import crud
+from bot.keyboards.keyboards import get_admin_extend_keyboard
 
 router = Router()
 
@@ -99,7 +100,7 @@ async def reject_payment(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("extend_"))
 async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано количество месяцев для продления"""
-    months = int(callback.data.split("_")[2])
+    months = int(callback.data.split("_")[1])
     
     # Рассчитываем сумму
     if months == 1:

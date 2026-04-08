@@ -1,6 +1,6 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
@@ -21,8 +21,11 @@ class QuestionState(StatesGroup):
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     """Обработчик команды /start"""
+
+    await state.clear()
+
     async with message.bot.get_db_session() as session:
         user = await crud.get_or_create_user(
             session, 
@@ -49,8 +52,16 @@ async def cmd_start(message: Message):
         if has_subscription:
             await message.answer("✅ У вас есть активная подписка!")
 
+@router.message(F.text, StateFilter(QuestionState.waiting_for_question))
+async def block_buttons_during_question(message: Message, state: FSMContext):
+    """Блокируем нажатие на другие кнопки во время вопроса"""
+    await message.answer(
+        "⚠️ Вы сейчас задаете вопрос.\n"
+        "Пожалуйста, напишите ваш вопрос или нажмите 'Отмена'.\n\n",
+        reply_markup=get_question_keyboard()
+    )
 
-@router.message(F.text == "📦 Купить подписку")
+@router.message(F.text == "📦 Купить подписку", ~StateFilter(QuestionState.waiting_for_question))
 async def buy_subscription(message: Message):
     """Покупка подписки"""
     async with message.bot.get_db_session() as session:
@@ -86,7 +97,7 @@ async def buy_subscription(message: Message):
             reply_markup=get_payment_keyboard()
         )
 
-@router.message(F.text == "🔄 Продлить подписку")
+@router.message(F.text == "🔄 Продлить подписку", ~StateFilter(QuestionState.waiting_for_question))
 async def extend_subscription(message: Message):
     """Продление подписки"""
     async with message.bot.get_db_session() as session:
@@ -108,6 +119,41 @@ async def extend_subscription(message: Message):
             "📅 Выберите срок продления:",
             reply_markup=get_extend_payment_keyboard()
         )
+
+@router.message(F.text == "❓ Задать вопрос", ~StateFilter(QuestionState.waiting_for_question))
+async def ask_question(message: Message, state: FSMContext):
+    """Начать процесс задавания вопроса"""
+    await message.answer(
+        "📝 Напишите ваш вопрос.\n"
+        "Администратор ответит вам в ближайшее время.\n\n",
+        reply_markup=get_question_keyboard()
+    )
+    await state.set_state(QuestionState.waiting_for_question)
+
+@router.message(F.text == "ℹ️ Моя подписка")
+async def check_subscription(message: Message):
+    """Проверка статуса подписки"""
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Ошибка! Попробуйте /start")
+            return
+        
+        has_subscription = await crud.check_subscription_status(session, user.id)
+        
+        if has_subscription:
+            subscription = await crud.get_user_subscription(session, user.id)
+            days_left = (subscription.next_payment - datetime.now()).days + 1
+            await message.answer(
+                f"✅ Подписка активна!\n\n"
+                f"📅 Следующее списание: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
+                f"⏰ Осталось дней: {days_left}"
+            )
+        else:
+            await message.answer(
+                "❌ У вас нет активной подписки.\n\n"
+                "Для покупки нажмите кнопку 'Купить подписку'"
+            )
 
 @router.callback_query(F.data == "one-month_payment")
 async def extend_one_month_payment(callback: CallbackQuery, state: FSMContext):
@@ -176,19 +222,6 @@ async def payment_cancel(callback: CallbackQuery):
     await callback.message.answer("❌ Оплата отменена.")
     await callback.answer()
 
-
-@router.message(F.text == "❓ Задать вопрос")
-async def ask_question(message: Message, state: FSMContext):
-    """Начать процесс задавания вопроса"""
-    await message.answer(
-        "📝 Напишите ваш вопрос.\n"
-        "Администратор ответит вам в ближайшее время.\n\n"
-        "Для отмены отправьте /cancel",
-        reply_markup=get_question_keyboard()
-    )
-    await state.set_state(QuestionState.waiting_for_question)
-
-
 @router.callback_query(F.data == "question_cancel")
 async def question_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -233,7 +266,7 @@ async def check_subscription(message: Message):
         
         if has_subscription:
             subscription = await crud.get_user_subscription(session, user.id)
-            days_left = (subscription.next_payment - datetime.now() + 1).days
+            days_left = (subscription.next_payment - datetime.now()).days + 1
             await message.answer(
                 f"✅ Подписка активна!\n\n"
                 f"📅 Следующее списание: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
