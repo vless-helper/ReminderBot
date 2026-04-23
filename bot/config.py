@@ -43,7 +43,15 @@ class Config:
 
     ADMIN_API_URL: str = os.getenv("ADMIN_API_URL", "http://localhost:8080")
 
+    BASE_PRICE: int = int(os.getenv("BASE_PRICE", "150"))
     
+    # Скидки
+    BULK_DISCOUNT: int = int(os.getenv("BULK_DISCOUNT", "95"))  # 5% скидка за несколько конфигов
+    PERIOD_DISCOUNT_3: int = int(os.getenv("PERIOD_DISCOUNT_3", "95"))   # 5% скидка за 3 месяца
+    PERIOD_DISCOUNT_6: int = int(os.getenv("PERIOD_DISCOUNT_6", "90"))   # 10% скидка за 6 месяцев
+    PERIOD_DISCOUNT_12: int = int(os.getenv("PERIOD_DISCOUNT_12", "85")) # 15% скидка за 12 месяцев
+
+
 
 
 

@@ -4,7 +4,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 import html
 
-from bot.config import config
+from bot.config import config 
 from bot.db import crud
 from bot.keyboards.keyboards import get_admin_extend_keyboard
 from bot.api.client import admin_api
@@ -40,15 +40,17 @@ async def answer_question(message: Message):
     except ValueError:
         await message.answer("❌ Неверный формат ID пользователя")
 
+# bot/handlers/admin.py
 @router.callback_query(F.data.startswith("confirm_payment_"))
 async def confirm_payment(callback: CallbackQuery):
-    """Подтверждение оплаты и создание конфига"""
+    """Подтверждение оплаты (подписки или нового конфига)"""
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("⛔ У вас нет прав", show_alert=True)
         return
     
-    user_id = int(callback.data.split("_")[2])
-    username = f"user_{user_id}"
+    parts = callback.data.split("_")
+    user_id = int(parts[2])
+    is_new_config = len(parts) > 3 and parts[3] == "new"
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, user_id)
@@ -56,55 +58,80 @@ async def confirm_payment(callback: CallbackQuery):
             await callback.answer("Пользователь не найден", show_alert=True)
             return
         
-        # Находим последний необработанный платеж
+        # Находим последний платеж
         payment = await crud.get_last_pending_payment(session, user.id)
         if payment:
             await crud.update_payment_status(session, payment.id, "completed")
         
-        # Продлеваем подписку
-        await crud.extend_subscription(session, user.id, config.SUBSCRIPTION_DAYS)
-        
-        await callback.answer("✅ Оплата подтверждена!", show_alert=True)
-        
-        # Удаляем клавиатуру у сообщения админа
-        await callback.message.edit_reply_markup(reply_markup=None)
-        
-        # СОЗДАЕМ КОНФИГ В АДМИНКЕ
-        await callback.message.answer(f"🔄 Создаю конфиг для пользователя {user_id}...")
-        
-        config_number = 1
-        config_name = f"user_{user_id}_{config_number}"
-
-        vless_link = await admin_api.create_user_and_get_config(config_name)
-
-        if vless_link:
-            await crud.create_client_config(session, user.id, config_number, config_name, vless_link)
-        
-        if vless_link:
-            # Отправляем пользователю конфиг
-            await callback.bot.send_message(
-                user_id,
-                f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
-                f"🔗 Ваш VLESS конфиг:\n`{vless_link}`\n\n"
-                f"📱 Инструкция:\n"
-                f"1. Скачайте Amnesia\n"
-                f"2. Нажмите 'Импорт из буфера обмена'\n"
-                f"3. Вставьте ссылку\n\n"
-                f"Спасибо за покупку!",
-                parse_mode="Markdown"
-            )
-            await callback.message.answer(f"✅ Конфиг создан и отправлен пользователю {user_id}")
-        else:
-            await callback.message.answer(f"⚠️ Оплата подтверждена, но не удалось создать конфиг для {user_id}. Создайте вручную командой /create_config {user_id}")
+        if is_new_config:
+            # Получаем следующий номер конфига
+            next_number = await crud.get_next_config_number(session, user.id)
+            config_name = f"user_{user_id}_{next_number}"
             
-            await callback.bot.send_message(
-                user_id,
-                f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
-                f"⚠️ Конфиг будет отправлен администратором в ближайшее время.\n\n"
-                f"Спасибо за покупку!"
-            )
+            # Создаем конфиг в админке
+            vless_link = await admin_api.create_user_and_get_config(config_name)
+            
+            if vless_link:
+                # Сохраняем конфиг в БД
+                new_config = await crud.create_client_config(
+                    session, user.id, next_number, config_name, vless_link
+                )
+                
+                await callback.bot.send_message(
+                    user_id,
+                    f"✅ Новый конфиг #{next_number} создан!\n\n"
+                    f"VLESS ссылка:\n{vless_link}\n\n"
+                    f"Сохраните ссылку в надежном месте."
+                )
+                
+                await callback.answer(f"✅ Конфиг #{next_number} создан!", show_alert=True)
+            else:
+                await callback.answer("❌ Не удалось создать конфиг", show_alert=True)
+        else:
+            # Обычное продление подписки
+            await crud.extend_subscription(session, user.id, config.SUBSCRIPTION_DAYS)
+            
+            # Проверяем, есть ли уже конфиги у пользователя
+            existing_configs = await crud.get_user_configs(session, user.id)
+            
+            if not existing_configs:
+                # Создаем первый конфиг для пользователя
+                config_number = 1
+                config_name = f"user_{user_id}_{config_number}"
+                
+                # Создаем конфиг в админке
+                vless_link = await admin_api.create_user_and_get_config(config_name)
+                
+                if vless_link:
+                    # Сохраняем конфиг в БД
+                    new_config = await crud.create_client_config(
+                        session, user.id, config_number, config_name, vless_link, is_protected=True
+                    )
+                    
+                    await callback.bot.send_message(
+                        user_id,
+                        f"✅ Ваша оплата подтверждена!\n"
+                        f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
+                        f"🔗 Ваш первый конфиг:\n{vless_link}\n\n"
+                        f"📱 Инструкция по установке в Amnesia"
+                    )
+                else:
+                    await callback.bot.send_message(
+                        user_id,
+                        f"✅ Ваша оплата подтверждена!\n"
+                        f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
+                        f"⚠️ Конфиг будет создан автоматически позже."
+                    )
+            else:
+                # У пользователя уже есть конфиги
+                await callback.bot.send_message(
+                    user_id,
+                    f"✅ Ваша оплата подтверждена!\n"
+                    f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
+                    f"Спасибо за покупку!"
+                )
+            
+            await callback.answer("✅ Оплата подтверждена!", show_alert=True)
 
 @router.callback_query(F.data.startswith("reject_payment_"))
 async def reject_payment(callback: CallbackQuery):
@@ -132,31 +159,38 @@ async def reject_payment(callback: CallbackQuery):
             "Пожалуйста, свяжитесь с администратором для уточнения деталей."
         )
 
-
 @router.callback_query(F.data.startswith("extend_"))
 async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано количество месяцев для продления"""
-    months = int(callback.data.split("_")[1])
-    
-    # Рассчитываем сумму
-    if months == 1:
-        amount = config.SUBSCRIPTION_PRICE
-    elif months == 3:
-        amount = int(config.SUBSCRIPTION_PRICE * 2.7)  # 2700
-    elif months == 6:
-        amount = int(config.SUBSCRIPTION_PRICE * 5)    # 5000
-    elif months == 12:
-        amount = int(config.SUBSCRIPTION_PRICE * 9)    # 9000
-    else:
-        amount = config.SUBSCRIPTION_PRICE * months
-    
-    await callback.message.edit_reply_markup(reply_markup=None)
+    parts = callback.data.split("_")
+    months = int(parts[1])
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
-        if user:
-            payment = await crud.create_payment(session, user.id, status="pending", amount=amount, months=months)
-            await state.update_data(payment_id=payment.id, months=months, amount=amount)
+        if not user:
+            await callback.answer("❌ Пользователь не найден", show_alert=True)
+            return
+        
+        # Получаем месячную цену (базовая цена * количество конфигов)
+        monthly_price = await crud.calculate_monthly_price(session, user.id)
+        
+        # Рассчитываем цену в зависимости от количества месяцев
+        if months == 1:
+            amount = monthly_price
+        elif months == 3:
+            amount = int(monthly_price * 3 * 0.95)  # 5% скидка
+        elif months == 6:
+            amount = int(monthly_price * 6 * 0.9)   # 10% скидка
+        elif months == 12:
+            amount = int(monthly_price * 12 * 0.85) # 15% скидка
+        else:
+            amount = monthly_price * months
+        
+        # Создаем платеж
+        payment = await crud.create_payment(session, user.id, status="pending", amount=amount, months=months)
+        await state.update_data(payment_id=payment.id, months=months, amount=amount)
+    
+    await callback.message.edit_reply_markup(reply_markup=None)
     
     await callback.message.answer(
         f"✅ Спасибо! Вы выбрали продление на {months} месяц(ев).\n"
@@ -217,7 +251,7 @@ async def confirm_extend_payment(callback: CallbackQuery):
         
         # Уведомляем пользователя
         if vless_link:
-            await cllback.bot.send_message(
+            await callback.bot.send_message(
                 user_id,
                 f"✅ Ваша оплата подтверждена!\n"
                 f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
@@ -238,9 +272,6 @@ async def confirm_extend_payment(callback: CallbackQuery):
             )
 
 #API
-
-# bot/handlers/admin.py - добавить новые команды
-from bot.api.client import admin_api
 
 @router.message(Command("create_config"))
 async def create_user_config(message: Message):

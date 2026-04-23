@@ -4,10 +4,22 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
+import asyncio
+from sqlalchemy import select
+from bot.db.models import User
+
 
 from bot.db.models import ClientConfig
 from bot.db import crud
-from bot.keyboards.keyboards import get_main_keyboard, get_payment_keyboard, get_question_keyboard, get_admin_keyboard, get_extend_payment_keyboard, get_configs_keyboard, get_config_actions_keyboard
+from bot.keyboards.keyboards import (
+    get_main_keyboard, 
+    get_payment_keyboard, 
+    get_question_keyboard, 
+    get_admin_keyboard, 
+    get_extend_payment_keyboard, 
+    get_configs_keyboard, 
+    get_config_actions_keyboard
+)
 from bot.config import config
 from bot.api.client import admin_api
 
@@ -47,7 +59,7 @@ async def cmd_start(message: Message, state: FSMContext):
         welcome_text = (
             "👋 Добро пожаловать!\n\n"
             "Я бот для продажи Amnesia VPN.\n\n"
-            f"💰 Цена подписки: {config.SUBSCRIPTION_PRICE}₽/месяц\n\n"
+            f"💰 Цена подписки: {config.BASE_PRICE}₽/месяц\n\n"
             "📌 Для покупки нажмите кнопку 'Купить подписку'\n"
             "❓ Если есть вопросы - кнопка 'Задать вопрос'\n"
             "ℹ️ Для проверки статуса - 'Моя подписка'"
@@ -92,7 +104,7 @@ async def buy_subscription(message: Message):
             return
         
         price_info = (
-            f"💰 Стоимость подписки: {config.SUBSCRIPTION_PRICE}₽\n\n"
+            f"💰 Стоимость подписки: {config.BASE_PRICE}₽\n\n"
             f"📥 Скачать Amnesia: {config.AMNESIA_DOWNLOAD_LINK}\n\n"
             f"🔧 Инструкция по настройке туннеля:\n{config.TUNNEL_INSTRUCTION}\n\n"
             f"💳 Оплата:\n"
@@ -124,9 +136,12 @@ async def extend_subscription(message: Message):
             )
             return
         
+        # Получаем количество активных конфигов
+        configs_count = await crud.get_active_configs_count(session, user.id)
+        
         await message.answer(
             "📅 Выберите срок продления:",
-            reply_markup=get_extend_payment_keyboard()
+            reply_markup=get_extend_payment_keyboard(user.id, configs_count)
         )
 
 @router.message(F.text == "❓ Задать вопрос", ~StateFilter(QuestionState.waiting_for_question))
@@ -172,7 +187,7 @@ async def extend_one_month_payment(callback: CallbackQuery, state: FSMContext):
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
         if user:
-            payment = await crud.create_payment(session, user.id, status="pending", amount=config.SUBSCRIPTION_PRICE, months=1)
+            payment = await crud.create_payment(session, user.id, status="pending", amount=config.BASE_PRICE, months=1)
             await state.update_data(payment_id=payment.id)
     
     await callback.message.answer(
@@ -186,7 +201,7 @@ async def extend_one_month_payment(callback: CallbackQuery, state: FSMContext):
             f"💰 Новый платеж!\n\n"
             f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
             f"ID: {callback.from_user.id}\n"
-            f"Сумма: {config.SUBSCRIPTION_PRICE}₽\n\n"
+            f"Сумма: {config.BASE_PRICE}₽\n\n"
             f"Проверьте банк и подтвердите оплату.",
             reply_markup=get_admin_keyboard(callback.from_user.id)
         )
@@ -196,29 +211,46 @@ async def extend_one_month_payment(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "payment_confirmed")
 async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
-    """Пользователь подтвердил оплату"""
+    """Пользователь подтвердил оплату (может быть оплата подписки или нового конфига)"""
     await callback.message.edit_reply_markup(reply_markup=None)
+    
+    # Проверяем, есть ли данные о создании нового конфига
+    state_data = await state.get_data()
+    is_new_config = state_data.get("new_config_number") is not None
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
-        if user:
-            payment = await crud.create_payment(session, user.id, status="pending")
+        if not user:
+            await callback.message.answer("❌ Ошибка!")
+            return
+        
+        # Создаем запись о платеже
+        payment = await crud.create_payment(session, user.id, status="pending")
+        
+        if is_new_config:
+            # Это оплата нового конфига
+            await state.update_data(payment_id=payment.id, is_new_config=True)
+            payment_type = "нового конфига"
+        else:
+            # Это оплата подписки
             await state.update_data(payment_id=payment.id)
+            payment_type = "подписки"
     
     await callback.message.answer(
-        "✅ Спасибо! Я отправил уведомление администратору.\n"
-        "Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
+        f"✅ Спасибо! Я отправил уведомление администратору об оплате {payment_type}.\n"
+        "Ожидайте подтверждения. Обычно это занимает до 30 минут."
     )
     
+    # Отправляем уведомление админу
     for admin_id in config.ADMIN_IDS:
         await callback.bot.send_message(
             admin_id,
-            f"💰 Новый платеж!\n\n"
+            f"💰 НОВЫЙ ПЛАТЕЖ ({payment_type.upper()})!\n\n"
             f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
             f"ID: {callback.from_user.id}\n"
-            f"Сумма: {config.SUBSCRIPTION_PRICE}₽\n\n"
+            f"Тип: {payment_type}\n\n"
             f"Проверьте банк и подтвердите оплату.",
-            reply_markup=get_admin_keyboard(callback.from_user.id)
+            reply_markup=get_admin_keyboard(callback.from_user.id, is_new_config=is_new_config)
         )
     
     await callback.answer()
@@ -301,7 +333,6 @@ async def cancel_handler(message: Message, state: FSMContext):
 
 # Обработка создания доп. конфигов
 
-# bot/handlers/user.py
 @router.message(F.text == "📱 Мои конфиги")
 async def my_configs(message: Message):
     """Показать список конфигов пользователя"""
@@ -313,62 +344,223 @@ async def my_configs(message: Message):
         
         configs = await crud.get_user_configs(session, user.id)
         
+        # Добавьте отладочный вывод
+        print(f"Найдено конфигов: {len(configs)}")
+        for cfg in configs:
+            print(f"Конфиг #{cfg.config_number}: id={cfg.id}, is_active={cfg.is_active}")
+        
+        monthly_price = await crud.calculate_monthly_price(session, user.id)
+        
         if not configs:
             await message.answer(
                 "📭 У вас пока нет конфигов.\n\n"
-                "Создайте первый конфиг: /new_config"
+                "Создайте новый конфиг через меню 'Мои конфиги'"
             )
             return
         
-        text = "📱 Ваши конфиги:\n\n"
+        text = f"📱 Ваши конфиги ({len(configs)} шт.):\n\n"
+        text += f"💰 Ежемесячный платеж: {monthly_price}₽\n\n"
+
         for cfg in configs:
-            text += f"▫️ Конфиг #{cfg.config_number} - {cfg.created_at.strftime('%d.%m.%Y')}\n"
+            protected_mark = " 🔒" if cfg.is_protected else ""
+            text += f"▫️ Конфиг #{cfg.config_number}{protected_mark} - создан {cfg.created_at.strftime('%d.%m.%Y')}\n"
         
-        await message.answer(
-            text,
-            reply_markup=get_configs_keyboard(user.id, configs)
-        )
+        # Проверьте, что клавиатура создается
+        keyboard = get_configs_keyboard(user.id, configs)
+        
+        await message.answer(text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "create_new_config")
-async def create_new_config(callback: CallbackQuery):
-    """Создать новый конфиг"""
+async def create_new_config(callback: CallbackQuery, state: FSMContext):
+    """Создать новый конфиг (требует оплаты)"""
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
         if not user:
             await callback.answer("❌ Ошибка!", show_alert=True)
             return
         
-        # Получаем следующий номер
-        next_number = await crud.get_next_config_number(session, user.id)
-        config_name = f"user_{callback.from_user.id}_{next_number}"
-        
-        await callback.answer("🔄 Создаю новый конфиг...")
-        
-        # Создаем конфиг в админке
-        vless_link = await admin_api.create_user_and_get_config(config_name)
-        
-        if vless_link:
-            # Сохраняем в БД
-            config = await crud.create_client_config(
-                session, 
-                user.id, 
-                next_number, 
-                config_name, 
-                vless_link
-            )
-            
+        # Проверяем активную подписку
+        has_subscription = await crud.check_subscription_status(session, user.id)
+        if not has_subscription:
             await callback.message.answer(
-                f"✅ Новый конфиг #{next_number} создан!\n\n"
-                f"🔗 VLESS ссылка:\n`{vless_link}`\n\n"
-                f"Сохраните ссылку в надежном месте.",
-                parse_mode="Markdown"
+                "❌ У вас нет активной подписки.\n"
+                "Сначала оформите подписку через кнопку 'Купить подписку'"
             )
-        else:
-            await callback.message.answer("❌ Не удалось создать конфиг. Попробуйте позже.")
+            await callback.answer()
+            return
+        
+        # Получаем следующий номер конфига
+        next_number = await crud.get_next_config_number(session, user.id)
+        
+        # Рассчитываем стоимость нового конфига
+        current_price = await crud.calculate_monthly_price(session, user.id)
+        new_config_price = config.BASE_PRICE  # Цена за один новый конфиг
+        
+        # Сохраняем в состояние
+        await state.update_data(
+            new_config_number=next_number,
+            new_config_price=new_config_price
+        )
+        
+        await callback.message.answer(
+            f"📱 Создание нового конфига #{next_number}\n\n"
+            f"💰 Стоимость: {new_config_price}₽\n"
+            f"📅 Оплачивается вместе с ежемесячной подпиской\n\n"
+            f"После оплаты вы получите новый конфиг.\n\n"
+            f"💳 Реквизиты для оплаты:\n"
+            f"Карта: {config.CARD_NUMBER}\n"
+            f"Получатель: {config.CARD_HOLDER}\n\n"
+            f"❗️ После оплаты нажмите кнопку 'Я оплатил(а)'",
+            reply_markup=get_payment_keyboard()
+        )
     
     await callback.answer()
 
+# bot/handlers/user.py - добавить новые обработчики
+
+# bot/handlers/user.py - обновить select_config
+@router.callback_query(F.data.startswith("select_config_"))
+async def select_config(callback: CallbackQuery):
+    """Выбор конфига для действий"""
+    config_id = int(callback.data.split("_")[2])
+    
+    async with callback.bot.get_db_session() as session:
+        # Находим пользователя
+        
+        stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+        result_user = await session.execute(stmt_user)
+        user = result_user.scalar_one_or_none()
+        
+        if not user:
+            await callback.answer("❌ Пользователь не найден", show_alert=True)
+            return
+        
+        # Ищем конфиг
+        stmt = select(ClientConfig).where(
+            ClientConfig.id == config_id,
+            ClientConfig.user_id == user.id,
+            ClientConfig.is_active == True
+        )
+        result = await session.execute(stmt)
+        config = result.scalar_one_or_none()
+        
+        if not config:
+            await callback.answer("❌ Конфиг не найден", show_alert=True)
+            return
+        
+        await callback.message.edit_text(
+            f"📱 Конфиг #{config.config_number}\n\n"
+            f"📅 Создан: {config.created_at.strftime('%d.%m.%Y')}\n"
+            f"🔒 Статус: {'Защищенный (основной)' if config.is_protected else 'Активен'}\n\n"
+            f"Выберите действие:",
+            reply_markup=get_config_actions_keyboard(config.id, config.config_number, config.is_protected)
+        )
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delete_config_"))
+async def delete_config(callback: CallbackQuery):
+    """Удалить конфиг"""
+    config_id = int(callback.data.split("_")[2])
+    
+    async with callback.bot.get_db_session() as session:
+        # Сначала находим пользователя по telegram_id
+        from bot.db.models import User
+        from sqlalchemy import select
+        
+        stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+        result_user = await session.execute(stmt_user)
+        user = result_user.scalar_one_or_none()
+        
+        if not user:
+            await callback.answer("❌ Пользователь не найден", show_alert=True)
+            return
+        
+        # Находим конфиг по внутреннему user_id
+        stmt = select(ClientConfig).where(
+            ClientConfig.id == config_id,
+            ClientConfig.user_id == user.id,  # <-- используем внутренний ID!
+            ClientConfig.is_active == True
+        )
+        result = await session.execute(stmt)
+        config = result.scalar_one_or_none()
+        
+        if not config:
+            await callback.answer("❌ Конфиг не найден", show_alert=True)
+            return
+        
+        config_name = config.config_name
+        config_number = config.config_number
+        
+        # Деактивируем в БД бота
+        success = await crud.deactivate_config(session, config_id, user.id)
+        
+        if success:
+            # Удаляем из админки
+            await crud.delete_config_from_admin(session, config_name)
+            
+            await callback.message.edit_text(
+                f"✅ Конфиг #{config_number} успешно удален!\n\n"
+                f"Вы можете создать новый конфиг через меню 'Мои конфиги'."
+            )
+            
+            # Обновляем список конфигов
+            await asyncio.sleep(2)
+            
+            configs = await crud.get_user_configs(session, user.id)
+            monthly_price = await crud.calculate_monthly_price(session, user.id)
+            
+            if configs:
+                text = f"📱 Ваши конфиги ({len(configs)} шт.):\n\n"
+                text += f"💰 Ежемесячный платеж: {monthly_price}₽\n\n"
+                
+                for cfg in configs:
+                    text += f"▫️ Конфиг #{cfg.config_number} - создан {cfg.created_at.strftime('%d.%m.%Y')}\n"
+                
+                await callback.message.answer(
+                    text,
+                    reply_markup=get_configs_keyboard(user.id, configs)
+                )
+            else:
+                await callback.message.answer(
+                    "📭 У вас больше нет активных конфигов.\n\n"
+                    "Создайте новый конфиг через меню 'Мои конфиги'"
+                )
+        else:
+            await callback.answer("❌ Не удалось удалить конфиг", show_alert=True)
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_configs")
+async def back_to_configs(callback: CallbackQuery):
+    """Вернуться к списку конфигов"""
+    async with callback.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
+        if user:
+            configs = await crud.get_user_configs(session, user.id)
+            monthly_price = await crud.calculate_monthly_price(session, user.id)
+            
+            text = f"📱 Ваши конфиги ({len(configs)} шт.):\n\n"
+            text += f"💰 Ежемесячный платеж: {monthly_price}₽\n\n"
+            
+            for cfg in configs:
+                text += f"▫️ Конфиг #{cfg.config_number} - создан {cfg.created_at.strftime('%d.%m.%Y')}\n"
+            
+            await callback.message.edit_text(
+                text,
+                reply_markup=get_configs_keyboard(user.id, configs)
+            )
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data == "close_configs")
+async def close_configs(callback: CallbackQuery):
+    """Закрыть меню конфигов"""
+    await callback.message.delete()
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("show_config_"))
 async def show_config(callback: CallbackQuery):
@@ -376,7 +568,23 @@ async def show_config(callback: CallbackQuery):
     config_id = int(callback.data.split("_")[2])
     
     async with callback.bot.get_db_session() as session:
-        stmt = select(ClientConfig).where(ClientConfig.id == config_id)
+        # Сначала находим пользователя
+        from bot.db.models import User
+        from sqlalchemy import select
+        
+        stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+        result_user = await session.execute(stmt_user)
+        user = result_user.scalar_one_or_none()
+        
+        if not user:
+            await callback.answer("❌ Пользователь не найден", show_alert=True)
+            return
+        
+        stmt = select(ClientConfig).where(
+            ClientConfig.id == config_id,
+            ClientConfig.user_id == user.id,
+            ClientConfig.is_active == True
+        )
         result = await session.execute(stmt)
         config = result.scalar_one_or_none()
         

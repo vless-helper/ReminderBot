@@ -16,15 +16,17 @@ class ClientConfig(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    config_number: Mapped[int] = mapped_column(Integer, default=1)  # Номер конфига (1, 2, 3...)
-    config_name: Mapped[str] = mapped_column(String(128))  # Имя в админке (user_123456789_1)
-    vless_link: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # VLESS ссылка
-    is_active: Mapped[bool] = mapped_column(default=True)  # Активен ли конфиг
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("subscriptions.id"), nullable=True)  # Связь с подпиской
+    config_number: Mapped[int] = mapped_column(Integer, default=1)
+    config_name: Mapped[str] = mapped_column(String(128))
+    vless_link: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    is_protected: Mapped[bool] = mapped_column(default=False)
+    is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now())
-    last_used: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    paid_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # До когда оплачен
     
-    # Связь с пользователем
     user: Mapped["User"] = relationship("User", back_populates="configs")
+    subscription: Mapped["Subscription"] = relationship("Subscription", back_populates="configs")
 
 class User(Base):
     __tablename__ = "users"
@@ -66,13 +68,11 @@ class Subscription(Base):
     next_payment: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(32), default="active")
     period_days: Mapped[int] = mapped_column(Integer, default=30)
-    last_reminder_sent: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), 
-        nullable=True
-    )
+    last_reminder_sent: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    active_configs_count: Mapped[int] = mapped_column(Integer, default=0)  # Количество активных конфигов
     
-    # Обратная связь
     user: Mapped["User"] = relationship("User", back_populates="subscription")
+    configs: Mapped[list["ClientConfig"]] = relationship("ClientConfig", back_populates="subscription")
 
 
 class Payment(Base):

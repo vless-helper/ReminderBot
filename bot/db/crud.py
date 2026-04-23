@@ -4,6 +4,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy import select, update, and_
 from typing import Optional, List
 from bot.db.models import ClientConfig
+from bot.config import config
 
 from .models import User, Subscription, Payment
 
@@ -237,15 +238,82 @@ async def reset_reminder_flag(session: AsyncSession, subscription_id: int):
 
     # Операции с доп. конфигами 
 
+# bot/db/crud.py
 async def get_user_configs(session: AsyncSession, user_id: int) -> List[ClientConfig]:
-    """Получить все конфиги пользователя"""
+    """Получить все активные конфиги пользователя"""
+    from sqlalchemy import select
+    from bot.db.models import ClientConfig
+    
     stmt = select(ClientConfig).where(
         ClientConfig.user_id == user_id,
         ClientConfig.is_active == True
     ).order_by(ClientConfig.config_number)
     
     result = await session.execute(stmt)
-    return result.scalars().all()
+    configs = result.scalars().all()
+    print(f"DEBUG get_user_configs: user_id={user_id}, найдено={len(configs)}")
+    for cfg in configs:
+        print(f"  - id={cfg.id}, number={cfg.config_number}")
+    return configs
+
+
+async def get_active_configs_count(session: AsyncSession, user_id: int) -> int:
+    """Получить количество активных конфигов пользователя"""
+    configs = await get_user_configs(session, user_id)
+    return len(configs)
+
+async def calculate_monthly_price(session: AsyncSession, user_id: int) -> int:
+    """Рассчитать месячную стоимость подписки (базовая цена * количество конфигов)"""
+    configs_count = await get_active_configs_count(session, user_id)
+    base_price = config.BASE_PRICE  # 150₽ за конфиг
+    total_price = base_price * configs_count
+    
+    # Можно добавить скидку за количество конфигов (опционально)
+    if configs_count >= 10:
+        total_price = int(total_price * 0.9)  # 10% скидка от 10 конфигов
+    
+    return total_price
+
+
+async def create_client_config_with_payment(
+    session: AsyncSession, 
+    user_id: int, 
+    config_number: int,
+    config_name: str,
+    vless_link: str,
+    subscription_id: int,
+    paid_until: datetime
+) -> ClientConfig:
+    """Создать новый конфиг с привязкой к подписке"""
+    config = ClientConfig(
+        user_id=user_id,
+        config_number=config_number,
+        config_name=config_name,
+        vless_link=vless_link,
+        is_active=True,
+        subscription_id=subscription_id,
+        paid_until=paid_until
+    )
+    session.add(config)
+    await session.commit()
+    await session.refresh(config)
+    
+    # Обновляем количество активных конфигов в подписке
+    subscription = await get_user_subscription(session, user_id)
+    if subscription:
+        subscription.active_configs_count = await get_active_configs_count(session, user_id)
+        await session.commit()
+    
+    return config
+
+
+async def update_subscription_price(session: AsyncSession, user_id: int):
+    """Обновить стоимость подписки на основе количества конфигов"""
+    subscription = await get_user_subscription(session, user_id)
+    if subscription:
+        configs_count = await get_active_configs_count(session, user_id)
+        subscription.active_configs_count = configs_count
+        await session.commit()
 
 
 async def get_next_config_number(session: AsyncSession, user_id: int) -> int:
@@ -268,7 +336,8 @@ async def create_client_config(
     user_id: int, 
     config_number: int,
     config_name: str,
-    vless_link: str
+    vless_link: str,
+    is_protected: bool = False
 ) -> ClientConfig:
     """Создать новый конфиг для пользователя"""
     config = ClientConfig(
@@ -276,16 +345,45 @@ async def create_client_config(
         config_number=config_number,
         config_name=config_name,
         vless_link=vless_link,
-        is_active=True
+        is_active=True,
+        is_protected=is_protected  # Добавляем флаг защиты
     )
     session.add(config)
     await session.commit()
     await session.refresh(config)
     return config
 
-
-async def deactivate_config(session: AsyncSession, config_id: int):
-    """Деактивировать конфиг (не удалять, а пометить неактивным)"""
-    stmt = update(ClientConfig).where(ClientConfig.id == config_id).values(is_active=False)
-    await session.execute(stmt)
+async def deactivate_config(session: AsyncSession, config_id: int, user_id: int) -> bool:
+    """Деактивировать конфиг (нельзя удалить защищенный конфиг)"""
+    # Проверяем, что конфиг принадлежит пользователю и не защищен
+    stmt = select(ClientConfig).where(
+        ClientConfig.id == config_id,
+        ClientConfig.user_id == user_id,
+        ClientConfig.is_active == True,
+        ClientConfig.is_protected == False  # Защищенные нельзя удалить
+    )
+    result = await session.execute(stmt)
+    config = result.scalar_one_or_none()
+    
+    if not config:
+        return False
+    
+    # Деактивируем конфиг
+    config.is_active = False
     await session.commit()
+    
+    # Обновляем количество активных конфигов в подписке
+    subscription = await get_user_subscription(session, user_id)
+    if subscription:
+        active_count = await get_active_configs_count(session, user_id)
+        subscription.active_configs_count = active_count
+        await session.commit()
+    
+    return True
+
+
+async def delete_config_from_admin(session: AsyncSession, config_name: str) -> bool:
+    """Удалить конфиг из админки (без проверок)"""
+    # Здесь вызов API к вашей админке
+    from bot.api.client import admin_api
+    return await admin_api.delete_user(config_name)
