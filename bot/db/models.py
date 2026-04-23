@@ -11,6 +11,20 @@ from typing import Optional
 
 from bot.db.base import Base
 
+class ClientConfig(Base):
+    __tablename__ = "client_configs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    config_number: Mapped[int] = mapped_column(Integer, default=1)  # Номер конфига (1, 2, 3...)
+    config_name: Mapped[str] = mapped_column(String(128))  # Имя в админке (user_123456789_1)
+    vless_link: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # VLESS ссылка
+    is_active: Mapped[bool] = mapped_column(default=True)  # Активен ли конфиг
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now())
+    last_used: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # Связь с пользователем
+    user: Mapped["User"] = relationship("User", back_populates="configs")
 
 class User(Base):
     __tablename__ = "users"
@@ -33,6 +47,12 @@ class User(Base):
     # Добавляем связь с платежами
     payments: Mapped[list["Payment"]] = relationship(
         "Payment", 
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+
+    configs: Mapped[list["ClientConfig"]] = relationship(
+        "ClientConfig", 
         back_populates="user",
         cascade="all, delete-orphan"
     )

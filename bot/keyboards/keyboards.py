@@ -9,7 +9,8 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📦 Купить подписку")],
         [KeyboardButton(text="🔄 Продлить подписку")],
         [KeyboardButton(text="❓ Задать вопрос")],
-        [KeyboardButton(text="ℹ️ Моя подписка")]
+        [KeyboardButton(text="ℹ️ Моя подписка")],
+        [KeyboardButton(text="📱 Мои конфиги")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -69,4 +70,31 @@ def get_confirm_question_keyboard(question_id: int) -> InlineKeyboardMarkup:
     """Клавиатура для подтверждения ответа на вопрос"""
     builder = InlineKeyboardBuilder()
     builder.button(text="📨 Отправить ответ", callback_data=f"send_answer_{question_id}")
+    return builder.as_markup()
+
+# Клава для конфигов 
+
+def get_configs_keyboard(user_id: int, configs: list) -> InlineKeyboardMarkup:
+    """Клавиатура для выбора конфига"""
+    builder = InlineKeyboardBuilder()
+    
+    for config in configs:
+        builder.button(
+            text=f"📱 Конфиг #{config.config_number}", 
+            callback_data=f"get_config_{config.id}"
+        )
+    
+    builder.button(text="➕ Создать новый конфиг", callback_data="create_new_config")
+    builder.button(text="❌ Закрыть", callback_data="close_configs")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_config_actions_keyboard(config_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура действий с конфигом"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔗 Получить ссылку", callback_data=f"show_config_{config_id}")
+    builder.button(text="🗑 Удалить конфиг", callback_data=f"delete_config_{config_id}")
+    builder.button(text="◀️ Назад", callback_data="back_to_configs")
+    builder.adjust(1)
     return builder.as_markup()

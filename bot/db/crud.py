@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload 
 from sqlalchemy import select, update, and_
 from typing import Optional, List
+from bot.db.models import ClientConfig
 
 from .models import User, Subscription, Payment
 
@@ -231,5 +232,60 @@ async def reset_reminder_flag(session: AsyncSession, subscription_id: int):
         .where(Subscription.id == subscription_id)
         .values(last_reminder_sent=None)
     )
+    await session.execute(stmt)
+    await session.commit()
+
+    # Операции с доп. конфигами 
+
+async def get_user_configs(session: AsyncSession, user_id: int) -> List[ClientConfig]:
+    """Получить все конфиги пользователя"""
+    stmt = select(ClientConfig).where(
+        ClientConfig.user_id == user_id,
+        ClientConfig.is_active == True
+    ).order_by(ClientConfig.config_number)
+    
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_next_config_number(session: AsyncSession, user_id: int) -> int:
+    """Получить следующий номер конфига для пользователя"""
+    stmt = select(ClientConfig).where(
+        ClientConfig.user_id == user_id,
+        ClientConfig.is_active == True
+    )
+    result = await session.execute(stmt)
+    configs = result.scalars().all()
+    
+    if not configs:
+        return 1
+    else:
+        return max(c.config_number for c in configs) + 1
+
+
+async def create_client_config(
+    session: AsyncSession, 
+    user_id: int, 
+    config_number: int,
+    config_name: str,
+    vless_link: str
+) -> ClientConfig:
+    """Создать новый конфиг для пользователя"""
+    config = ClientConfig(
+        user_id=user_id,
+        config_number=config_number,
+        config_name=config_name,
+        vless_link=vless_link,
+        is_active=True
+    )
+    session.add(config)
+    await session.commit()
+    await session.refresh(config)
+    return config
+
+
+async def deactivate_config(session: AsyncSession, config_id: int):
+    """Деактивировать конфиг (не удалять, а пометить неактивным)"""
+    stmt = update(ClientConfig).where(ClientConfig.id == config_id).values(is_active=False)
     await session.execute(stmt)
     await session.commit()

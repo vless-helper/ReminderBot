@@ -5,11 +5,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
 
+from bot.db.models import ClientConfig
 from bot.db import crud
-from bot.keyboards.keyboards import get_main_keyboard, get_payment_keyboard, get_question_keyboard, get_admin_keyboard, get_extend_payment_keyboard
+from bot.keyboards.keyboards import get_main_keyboard, get_payment_keyboard, get_question_keyboard, get_admin_keyboard, get_extend_payment_keyboard, get_configs_keyboard, get_config_actions_keyboard
 from bot.config import config
+from bot.api.client import admin_api
 
 router = Router()
+
+MAIN_MENU_BUTTONS = [
+    "📦 Купить подписку",
+    "🔄 Продлить подписку", 
+    "❓ Задать вопрос",
+    "ℹ️ Моя подписка"
+]
 
 # Состояния для FSM
 class PaymentState(StatesGroup):
@@ -52,7 +61,7 @@ async def cmd_start(message: Message, state: FSMContext):
         if has_subscription:
             await message.answer("✅ У вас есть активная подписка!")
 
-@router.message(F.text, StateFilter(QuestionState.waiting_for_question))
+@router.message(F.text.in_(MAIN_MENU_BUTTONS), StateFilter(QuestionState.waiting_for_question))
 async def block_buttons_during_question(message: Message, state: FSMContext):
     """Блокируем нажатие на другие кнопки во время вопроса"""
     await message.answer(
@@ -288,3 +297,97 @@ async def cancel_handler(message: Message, state: FSMContext):
     
     await state.clear()
     await message.answer("✅ Действие отменено.")
+
+
+# Обработка создания доп. конфигов
+
+# bot/handlers/user.py
+@router.message(F.text == "📱 Мои конфиги")
+async def my_configs(message: Message):
+    """Показать список конфигов пользователя"""
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Ошибка! Попробуйте /start")
+            return
+        
+        configs = await crud.get_user_configs(session, user.id)
+        
+        if not configs:
+            await message.answer(
+                "📭 У вас пока нет конфигов.\n\n"
+                "Создайте первый конфиг: /new_config"
+            )
+            return
+        
+        text = "📱 Ваши конфиги:\n\n"
+        for cfg in configs:
+            text += f"▫️ Конфиг #{cfg.config_number} - {cfg.created_at.strftime('%d.%m.%Y')}\n"
+        
+        await message.answer(
+            text,
+            reply_markup=get_configs_keyboard(user.id, configs)
+        )
+
+
+@router.callback_query(F.data == "create_new_config")
+async def create_new_config(callback: CallbackQuery):
+    """Создать новый конфиг"""
+    async with callback.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
+        if not user:
+            await callback.answer("❌ Ошибка!", show_alert=True)
+            return
+        
+        # Получаем следующий номер
+        next_number = await crud.get_next_config_number(session, user.id)
+        config_name = f"user_{callback.from_user.id}_{next_number}"
+        
+        await callback.answer("🔄 Создаю новый конфиг...")
+        
+        # Создаем конфиг в админке
+        vless_link = await admin_api.create_user_and_get_config(config_name)
+        
+        if vless_link:
+            # Сохраняем в БД
+            config = await crud.create_client_config(
+                session, 
+                user.id, 
+                next_number, 
+                config_name, 
+                vless_link
+            )
+            
+            await callback.message.answer(
+                f"✅ Новый конфиг #{next_number} создан!\n\n"
+                f"🔗 VLESS ссылка:\n`{vless_link}`\n\n"
+                f"Сохраните ссылку в надежном месте.",
+                parse_mode="Markdown"
+            )
+        else:
+            await callback.message.answer("❌ Не удалось создать конфиг. Попробуйте позже.")
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("show_config_"))
+async def show_config(callback: CallbackQuery):
+    """Показать VLESS ссылку конфига"""
+    config_id = int(callback.data.split("_")[2])
+    
+    async with callback.bot.get_db_session() as session:
+        stmt = select(ClientConfig).where(ClientConfig.id == config_id)
+        result = await session.execute(stmt)
+        config = result.scalar_one_or_none()
+        
+        if config and config.vless_link:
+            await callback.message.answer(
+                f"🔗 Конфиг #{config.config_number}:\n\n"
+                f"`{config.vless_link}`\n\n"
+                f"📱 Инструкция по установке в Amnesia",
+                parse_mode="Markdown"
+            )
+        else:
+            await callback.answer("❌ Конфиг не найден", show_alert=True)
+    
+    await callback.answer()

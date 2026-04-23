@@ -41,5 +41,10 @@ class Config:
     AMNESIA_DOWNLOAD_LINK: str = os.getenv("AMNESIA_DOWNLOAD_LINK", "")
     TUNNEL_INSTRUCTION: str = os.getenv("TUNNEL_INSTRUCTION", "")
 
+    ADMIN_API_URL: str = os.getenv("ADMIN_API_URL", "http://localhost:8080")
+
+    
+
+
 
 config = Config()
