@@ -1,4 +1,3 @@
-# bot/api/client.py
 import aiohttp
 import logging
 from typing import Optional, Dict, Any
@@ -15,7 +14,6 @@ class AdminAPIClient:
             "Content-Type": "application/json"
         }
         
-        # bot/api/client.py
     async def create_user(self, name: str) -> tuple[bool, Optional[str]]:
         """
         Создать пользователя в админке
@@ -142,6 +140,27 @@ class AdminAPIClient:
                 logger.error(f"Ошибка соединения с админкой: {e}")
                 return None
     
+    async def create_user_and_get_config(self, name: str) -> Optional[str]:
+        """
+        Создать пользователя и получить VLESS ссылку (удобный метод)
+        """
+        # Создаем пользователя
+        created = await self.create_user(name)
+        if not created:
+            return None
+        
+        # Получаем VLESS ссылку
+        vless_link = await self.get_vless_link(name)
+        return vless_link
+
+    async def create_user_with_number(self, base_name: str, number: int) -> tuple[bool, Optional[str], Optional[str]]:
+        """
+        Создать пользователя с номером конфига
+        Например: base_name = "user_1924089475", number = 1 -> "user_1924089475_1"
+        """
+        full_name = f"{base_name}_{number}"
+        return await self.create_user_and_get_config(full_name)
+    
     async def delete_user(self, name: str) -> bool:
         """
         Удалить пользователя из админки
@@ -162,19 +181,6 @@ class AdminAPIClient:
                 logger.error(f"Ошибка соединения с админкой: {e}")
                 return False
     
-    async def create_user_and_get_config(self, name: str) -> Optional[str]:
-        """
-        Создать пользователя и получить VLESS ссылку (удобный метод)
-        """
-        # Создаем пользователя
-        created = await self.create_user(name)
-        if not created:
-            return None
-        
-        # Получаем VLESS ссылку
-        vless_link = await self.get_vless_link(name)
-        return vless_link
-    
     async def health_check(self) -> bool:
         """Проверка доступности админки"""
         url = f"{self.base_url}/health"
@@ -186,13 +192,5 @@ class AdminAPIClient:
             except Exception:
                 return False
 
-    async def create_user_with_number(self, base_name: str, number: int) -> tuple[bool, Optional[str], Optional[str]]:
-        """
-        Создать пользователя с номером конфига
-        Например: base_name = "user_1924089475", number = 1 -> "user_1924089475_1"
-        """
-        full_name = f"{base_name}_{number}"
-        return await self.create_user_and_get_config(full_name)
-    
 # Создаем глобальный экземпляр клиента
 admin_api = AdminAPIClient()

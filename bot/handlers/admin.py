@@ -4,6 +4,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 import html
 
+from bot.utils.admin_utils import require_admin, get_args
 from bot.config import config 
 from bot.db import crud
 from bot.keyboards.keyboards import get_admin_extend_keyboard
@@ -14,21 +15,17 @@ router = Router()
 @router.message(Command("answer"))
 async def answer_question(message: Message):
     """Ответ на вопрос пользователя"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав для этой команды")
+    if not await require_admin(message):
         return
     
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer(
-            "❌ Использование: /answer [user_id] [текст ответа]\n"
-            "Пример: /answer 123456789 Спасибо за вопрос!"
-        )
+    args, error = get_args(message, min_args=2, usage="❌ Использование: /answer [user_id] [текст ответа]\nПример: /answer 123456789 Спасибо за вопрос!")
+    if error:
+        await message.answer(error)
         return
     
     try:
-        user_id = int(parts[1])
-        answer_text = parts[2]
+        user_id = int(args[0])
+        answer_text = "".join(args[1:])
         
         await message.bot.send_message(
             user_id,

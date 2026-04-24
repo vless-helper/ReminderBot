@@ -38,7 +38,7 @@ class User(Base):
         DateTime(timezone=True), default=lambda: datetime.now()
     )
 
-    # Добавляем связь с подпиской
+    # Связь с подпиской
     subscription: Mapped[Optional["Subscription"]] = relationship(
         "Subscription", 
         back_populates="user", 
@@ -46,7 +46,7 @@ class User(Base):
         cascade="all, delete-orphan"
     )
     
-    # Добавляем связь с платежами
+    # Связь с платежами
     payments: Mapped[list["Payment"]] = relationship(
         "Payment", 
         back_populates="user",
@@ -58,7 +58,6 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan"
     )
-
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
@@ -73,7 +72,6 @@ class Subscription(Base):
     
     user: Mapped["User"] = relationship("User", back_populates="subscription")
     configs: Mapped[list["ClientConfig"]] = relationship("ClientConfig", back_populates="subscription")
-
 
 class Payment(Base):
     __tablename__ = "payments"

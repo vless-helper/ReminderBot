@@ -1,12 +1,14 @@
-from datetime import datetime, timedelta
+from sqlalchemy import select, update, and_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload 
-from sqlalchemy import select, update, and_
+from datetime import datetime, timedelta
 from typing import Optional, List
 from bot.db.models import ClientConfig
 from bot.config import config
 
 from .models import User, Subscription, Payment
+
+# Обработка подписок
 
 async def extend_subscription(
     session: AsyncSession, 
@@ -39,60 +41,11 @@ async def extend_subscription(
     await session.refresh(subscription)
     return subscription
 
-async def get_last_pending_payment(session: AsyncSession, user_id: int) -> Optional[Payment]:
-    """Получить последний необработанный платеж пользователя"""
-    from sqlalchemy import desc
-    
-    stmt = select(Payment).where(
-        and_(
-            Payment.user_id == user_id,
-            Payment.status == "pending"
-        )
-    ).order_by(desc(Payment.created_at)).limit(1)
-    
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
-
-async def get_or_create_user(
-    session: AsyncSession, 
-    telegram_id: int, 
-    username: Optional[str] = None
-) -> User:
-    """Получить пользователя или создать нового"""
-    stmt = select(User).where(User.telegram_id == telegram_id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        user = User(
-            telegram_id=telegram_id,
-            username=username
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
-    
-    return user
-
-async def update_payment_status(session: AsyncSession, payment_id: int, status: str):
-    """Обновить статус платежа"""
-    stmt = update(Payment).where(Payment.id == payment_id).values(status=status)
-    await session.execute(stmt)
-    await session.commit()
-
-async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> Optional[User]:
-    """Получить пользователя по telegram_id"""
-    stmt = select(User).where(User.telegram_id == telegram_id)
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
-
-
 async def get_user_subscription(session: AsyncSession, user_id: int) -> Optional[Subscription]:
     """Получить подписку пользователя"""
     stmt = select(Subscription).where(Subscription.user_id == user_id)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
-
 
 async def check_subscription_status(session: AsyncSession, user_id: int) -> bool:
     """Проверить активна ли подписка"""
@@ -101,34 +54,13 @@ async def check_subscription_status(session: AsyncSession, user_id: int) -> bool
         return subscription.next_payment > datetime.now()
     return False
 
-
-async def create_payment(
-    session: AsyncSession, 
-    user_id: int, 
-    status: str = "pending",
-    amount: Optional[int] = None,
-    months: Optional[int] = None
-) -> Payment:
-    """Создать запись о платеже"""
-    payment = Payment(
-        user_id=user_id,
-        status=status,
-        amount=amount,
-        months=months
-    )
-    session.add(payment)
-    await session.commit()
-    await session.refresh(payment)
-    return payment
-
-
 async def extend_subscription_months(
     session: AsyncSession, 
     user_id: int, 
     months: int
 ) -> Subscription:
     """Продлить подписку на несколько месяцев"""
-    days = months * 30  # Или config.SUBSCRIPTION_DAYS * months
+    days = months * 30  
     
     subscription = await get_user_subscription(session, user_id)
     
@@ -155,6 +87,74 @@ async def extend_subscription_months(
     await session.refresh(subscription)
     return subscription
 
+# Обработка платежей
+
+async def get_last_pending_payment(session: AsyncSession, user_id: int) -> Optional[Payment]:
+    """Получить последний необработанный платеж пользователя"""
+    
+    stmt = select(Payment).where(
+        and_(
+            Payment.user_id == user_id,
+            Payment.status == "pending"
+        )
+    ).order_by(desc(Payment.created_at)).limit(1)
+    
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+async def update_payment_status(session: AsyncSession, payment_id: int, status: str):
+    """Обновить статус платежа"""
+    stmt = update(Payment).where(Payment.id == payment_id).values(status=status)
+    await session.execute(stmt)
+    await session.commit()
+
+async def create_payment(
+    session: AsyncSession, 
+    user_id: int, 
+    status: str = "pending",
+    amount: Optional[int] = None,
+    months: Optional[int] = None
+) -> Payment:
+    """Создать запись о платеже"""
+    payment = Payment(
+        user_id=user_id,
+        status=status,
+        amount=amount,
+        months=months
+    )
+    session.add(payment)
+    await session.commit()
+    await session.refresh(payment)
+    return payment
+
+# Обработка пользователей
+
+async def get_or_create_user(
+    session: AsyncSession, 
+    telegram_id: int, 
+    username: Optional[str] = None
+) -> User:
+    """Получить пользователя или создать нового"""
+    stmt = select(User).where(User.telegram_id == telegram_id)
+    result = await session.execute(stmt)
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        user = User(
+            telegram_id=telegram_id,
+            username=username
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+    
+    return user
+
+async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> Optional[User]:
+    """Получить пользователя по telegram_id"""
+    stmt = select(User).where(User.telegram_id == telegram_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 #Напоминалки 
 
@@ -214,7 +214,6 @@ async def get_expired_today_subscriptions(session: AsyncSession) -> List[Subscri
     result = await session.execute(stmt)
     return result.scalars().all()
 
-
 async def mark_reminder_sent(session: AsyncSession, subscription_id: int):
     """Отметить, что напоминание отправлено"""
     stmt = (
@@ -224,7 +223,6 @@ async def mark_reminder_sent(session: AsyncSession, subscription_id: int):
     )
     await session.execute(stmt)
     await session.commit()
-
 
 async def reset_reminder_flag(session: AsyncSession, subscription_id: int):
     """Сбросить флаг напоминания (для тестирования)"""
@@ -236,13 +234,10 @@ async def reset_reminder_flag(session: AsyncSession, subscription_id: int):
     await session.execute(stmt)
     await session.commit()
 
-    # Операции с доп. конфигами 
+# Операции с доп. конфигами 
 
-# bot/db/crud.py
 async def get_user_configs(session: AsyncSession, user_id: int) -> List[ClientConfig]:
     """Получить все активные конфиги пользователя"""
-    from sqlalchemy import select
-    from bot.db.models import ClientConfig
     
     stmt = select(ClientConfig).where(
         ClientConfig.user_id == user_id,
@@ -255,7 +250,6 @@ async def get_user_configs(session: AsyncSession, user_id: int) -> List[ClientCo
     for cfg in configs:
         print(f"  - id={cfg.id}, number={cfg.config_number}")
     return configs
-
 
 async def get_active_configs_count(session: AsyncSession, user_id: int) -> int:
     """Получить количество активных конфигов пользователя"""
@@ -274,46 +268,45 @@ async def calculate_monthly_price(session: AsyncSession, user_id: int) -> int:
     
     return total_price
 
-
-async def create_client_config_with_payment(
-    session: AsyncSession, 
-    user_id: int, 
-    config_number: int,
-    config_name: str,
-    vless_link: str,
-    subscription_id: int,
-    paid_until: datetime
-) -> ClientConfig:
-    """Создать новый конфиг с привязкой к подписке"""
-    config = ClientConfig(
-        user_id=user_id,
-        config_number=config_number,
-        config_name=config_name,
-        vless_link=vless_link,
-        is_active=True,
-        subscription_id=subscription_id,
-        paid_until=paid_until
-    )
-    session.add(config)
-    await session.commit()
-    await session.refresh(config)
+# async def create_client_config_with_payment(
+#     session: AsyncSession, 
+#     user_id: int, 
+#     config_number: int,
+#     config_name: str,
+#     vless_link: str,
+#     subscription_id: int,
+#     paid_until: datetime
+# ) -> ClientConfig:
+#     """Создать новый конфиг с привязкой к подписке"""
+#     config = ClientConfig(
+#         user_id=user_id,
+#         config_number=config_number,
+#         config_name=config_name,
+#         vless_link=vless_link,
+#         is_active=True,
+#         subscription_id=subscription_id,
+#         paid_until=paid_until
+#     )
+#     session.add(config)
+#     await session.commit()
+#     await session.refresh(config)
     
-    # Обновляем количество активных конфигов в подписке
-    subscription = await get_user_subscription(session, user_id)
-    if subscription:
-        subscription.active_configs_count = await get_active_configs_count(session, user_id)
-        await session.commit()
+#     # Обновляем количество активных конфигов в подписке
+#     subscription = await get_user_subscription(session, user_id)
+#     if subscription:
+#         subscription.active_configs_count = await get_active_configs_count(session, user_id)
+#         await session.commit()
     
-    return config
+#     return config
 
 
-async def update_subscription_price(session: AsyncSession, user_id: int):
-    """Обновить стоимость подписки на основе количества конфигов"""
-    subscription = await get_user_subscription(session, user_id)
-    if subscription:
-        configs_count = await get_active_configs_count(session, user_id)
-        subscription.active_configs_count = configs_count
-        await session.commit()
+# async def update_subscription_price(session: AsyncSession, user_id: int):
+#     """Обновить стоимость подписки на основе количества конфигов"""
+#     subscription = await get_user_subscription(session, user_id)
+#     if subscription:
+#         configs_count = await get_active_configs_count(session, user_id)
+#         subscription.active_configs_count = configs_count
+#         await session.commit()
 
 
 async def get_next_config_number(session: AsyncSession, user_id: int) -> int:
@@ -330,7 +323,6 @@ async def get_next_config_number(session: AsyncSession, user_id: int) -> int:
     else:
         return max(c.config_number for c in configs) + 1
 
-
 async def create_client_config(
     session: AsyncSession, 
     user_id: int, 
@@ -346,7 +338,7 @@ async def create_client_config(
         config_name=config_name,
         vless_link=vless_link,
         is_active=True,
-        is_protected=is_protected  # Добавляем флаг защиты
+        is_protected=is_protected  # флаг защиты
     )
     session.add(config)
     await session.commit()
@@ -381,9 +373,7 @@ async def deactivate_config(session: AsyncSession, config_id: int, user_id: int)
     
     return True
 
-
 async def delete_config_from_admin(session: AsyncSession, config_name: str) -> bool:
     """Удалить конфиг из админки (без проверок)"""
-    # Здесь вызов API к вашей админке
     from bot.api.client import admin_api
     return await admin_api.delete_user(config_name)
