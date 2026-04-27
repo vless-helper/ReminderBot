@@ -37,7 +37,6 @@ async def answer_question(message: Message):
     except ValueError:
         await message.answer("❌ Неверный формат ID пользователя")
 
-# bot/handlers/admin.py
 @router.callback_query(F.data.startswith("confirm_payment_"))
 async def confirm_payment(callback: CallbackQuery):
     """Подтверждение оплаты (подписки или нового конфига)"""
@@ -69,15 +68,23 @@ async def confirm_payment(callback: CallbackQuery):
             vless_link = await admin_api.create_user_and_get_config(config_name)
             
             if vless_link:
+                # Вычисляем дату, до которой оплачен конфиг
+                days_left = await crud.get_remaining_days_until_next_payment(session, user.id)
+                
+                # Устанавливаем paid_until для конфига
+                paid_until = datetime.now() + timedelta(days=days_left) if days_left > 0 else datetime.now() + timedelta(days=30)
+                
                 # Сохраняем конфиг в БД
                 new_config = await crud.create_client_config(
-                    session, user.id, next_number, config_name, vless_link
+                    session, user.id, next_number, config_name, vless_link,
+                    is_protected=False, paid_until=paid_until
                 )
                 
                 await callback.bot.send_message(
                     user_id,
                     f"✅ Новый конфиг #{next_number} создан!\n\n"
-                    f"VLESS ссылка:\n{vless_link}\n\n"
+                    f"🔗 VLESS ссылка:\n{vless_link}\n\n"
+                    f"📅 Оплачен до: {paid_until.strftime('%d.%m.%Y')}\n\n"
                     f"Сохраните ссылку в надежном месте."
                 )
                 
@@ -237,6 +244,9 @@ async def confirm_extend_payment(callback: CallbackQuery):
         # Продлеваем подписку на количество месяцев
         await crud.extend_subscription_months(session, user.id, months)
 
+        # Продлеваем paid_until для всех конфигов
+        await crud.extend_all_configs_paid_until(session, user.id, months)
+
         username = f"user_{user_id}"
         await admin_api.create_user(username)
         vless_link = await admin_api.get_vless_link(username)
@@ -273,20 +283,16 @@ async def confirm_extend_payment(callback: CallbackQuery):
 @router.message(Command("create_config"))
 async def create_user_config(message: Message):
     """Создать конфиг для пользователя (только админ)"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Использование: /create_config [telegram_id]\n"
-            "Пример: /create_config 123456789"
-        )
+    args, error = get_args(message, min_args=2, usage="❌ Использование: /create_config [user_id]\nПример: /create_config 123456789")
+    if error:
+        await message.answer(error)
         return
     
     try:
-        telegram_id = int(parts[1])
+        telegram_id = int(args[0])
         username = f"user_{telegram_id}"
         
         async with message.bot.get_db_session() as session:
@@ -327,20 +333,16 @@ async def create_user_config(message: Message):
 @router.message(Command("get_vless"))
 async def get_vless_link(message: Message):
     """Получить VLESS ссылку пользователя (только админ)"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Использование: /get_vless [telegram_id]\n"
-            "Пример: /get_vless 123456789"
-        )
+    args, error = get_args(message, min_args=2, usage="❌ Использование: /get_vless [user_id]\nПример: /get_vless 123456789")
+    if error:
+        await message.answer(error)
         return
-    
+
     try:
-        telegram_id = int(parts[1])
+        telegram_id = int(args[0])
         username = f"user_{telegram_id}"
         
         vless_link = await admin_api.get_vless_link(username)
@@ -361,20 +363,16 @@ async def get_vless_link(message: Message):
 @router.message(Command("delete_config"))
 async def delete_user_config(message: Message):
     """Удалить конфиг пользователя (только админ)"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Использование: /delete_config [telegram_id]\n"
-            "Пример: /delete_config 123456789"
-        )
+    args, error = get_args(message, min_args=2, usage="❌ Использование: /delete_config [user_id]\nПример: /delete_config 123456789")
+    if error:
+        await message.answer(error)
         return
-    
+
     try:
-        telegram_id = int(parts[1])
+        telegram_id = int(args[0])
         username = f"user_{telegram_id}"
         
         success = await admin_api.delete_user(username)
@@ -398,8 +396,7 @@ async def delete_user_config(message: Message):
 @router.message(Command("admin_status"))
 async def admin_status(message: Message):
     """Проверить статус админки"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
     is_healthy = await admin_api.health_check()
@@ -413,20 +410,16 @@ async def admin_status(message: Message):
 @router.message(Command("sync_user"))
 async def sync_user_to_admin(message: Message):
     """Синхронизировать пользователя из БД бота в админку"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Использование: /sync_user [telegram_id]\n"
-            "Пример: /sync_user 123456789"
-        )
+    args, error = get_args(message, min_args=2, usage="❌ Использование: /sync_user [user_id]\nПример: /sync_user 123456789")
+    if error:
+        await message.answer(error)
         return
-    
+
     try:
-        telegram_id = int(parts[1])
+        telegram_id = int(args[0])
         username = f"user_{telegram_id}"
         
         async with message.bot.get_db_session() as session:
@@ -456,8 +449,7 @@ async def sync_user_to_admin(message: Message):
 @router.message(Command("check_reminders"))
 async def check_reminders_now(message: Message):
     """Принудительная проверка напоминаний (только админ)"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
     await message.answer("🔄 Проверяю напоминания...")
@@ -474,8 +466,7 @@ async def check_reminders_now(message: Message):
 @router.message(Command("reset_reminder"))
 async def reset_reminder_flag(message: Message):
     """Сбросить флаг напоминания для тестирования"""
-    if message.from_user.id not in config.ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав")
+    if not await require_admin(message):
         return
     
     parts = message.text.split()

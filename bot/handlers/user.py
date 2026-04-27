@@ -392,22 +392,39 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
         
         # Получаем следующий номер конфига
         next_number = await crud.get_next_config_number(session, user.id)
+        # Получаем остаток дней до основного платежа
+        days_left = await crud.get_remaining_days_until_next_payment(session, user.id)
+        # Базовая цена за конфиг
+        base_config_price = config.BASE_PRICE
+
+        # Рассчитываем пропорциональную цену
+        if days_left > 0:
+            standard_month = 30
+            ratio = days_left / standard_month
+            prorated_price = int(base_config_price * ratio)
+            new_config_price = max(1, prorated_price)
         
-        # Рассчитываем стоимость нового конфига
-        current_price = await crud.calculate_monthly_price(session, user.id)
-        new_config_price = config.BASE_PRICE  # Цена за один новый конфиг
+            price_explanation = (
+                f"📅 До следующего платежа осталось {days_left} дней.\n"
+                f"💰 Плата за новый конфиг составит {new_config_price}₽ "
+                f"(пропорционально остатку месяца).\n"
+                f"При следующем продлении будет взиматься полная стоимость."
+            )
+        else:
+            new_config_price = base_config_price
+            price_explanation = "💰 Оплата за полный месяц."
         
         # Сохраняем в состояние
         await state.update_data(
             new_config_number=next_number,
-            new_config_price=new_config_price
+            new_config_price=new_config_price,
+            new_config_prorated=days_left > 0
         )
         
         await callback.message.answer(
             f"📱 Создание нового конфига #{next_number}\n\n"
-            f"💰 Стоимость: {new_config_price}₽\n"
-            f"📅 Оплачивается вместе с ежемесячной подпиской\n\n"
-            f"После оплаты вы получите новый конфиг.\n\n"
+            f"{price_explanation}\n\n"
+            f"Сумма к оплате: {new_config_price}₽\n\n"
             f"💳 Реквизиты для оплаты:\n"
             f"Карта: {config.CARD_NUMBER}\n"
             f"Получатель: {config.CARD_HOLDER}\n\n"
@@ -417,9 +434,6 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer()
 
-# bot/handlers/user.py - добавить новые обработчики
-
-# bot/handlers/user.py - обновить select_config
 @router.callback_query(F.data.startswith("select_config_"))
 async def select_config(callback: CallbackQuery):
     """Выбор конфига для действий"""
@@ -449,10 +463,19 @@ async def select_config(callback: CallbackQuery):
             await callback.answer("❌ Конфиг не найден", show_alert=True)
             return
         
+        status_text = "Активен"
+        if config.paid_until:
+            if config.paid_until < datetime.now():
+                status_text = "⚠️ Требуется продление"
+            else:
+                days_left = (config.paid_until - datetime.now()).days
+                status_text = f"Активен до {config.paid_until.strftime('%d.%m.%Y')} (осталось {days_left} дн.)"
+        
         await callback.message.edit_text(
             f"📱 Конфиг #{config.config_number}\n\n"
             f"📅 Создан: {config.created_at.strftime('%d.%m.%Y')}\n"
-            f"🔒 Статус: {'Защищенный (основной)' if config.is_protected else 'Активен'}\n\n"
+            f"🔒 Статус: {status_text}\n"
+            f"{'🔒 Защищенный (основной)' if config.is_protected else ''}\n\n"
             f"Выберите действие:",
             reply_markup=get_config_actions_keyboard(config.id, config.config_number, config.is_protected)
         )

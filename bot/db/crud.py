@@ -127,6 +127,39 @@ async def create_payment(
     await session.refresh(payment)
     return payment
 
+from datetime import datetime, timedelta
+
+async def get_remaining_days_until_next_payment(session: AsyncSession, user_id: int) -> int:
+    """
+    Получает количество дней до следующего платежа
+    """
+    subscription = await get_user_subscription(session, user_id)
+    if not subscription or subscription.next_payment <= datetime.now():
+        return 0
+    
+    days_left = (subscription.next_payment - datetime.now()).days
+    return max(0, days_left)
+
+
+async def calculate_prorated_price(session: AsyncSession, user_id: int, base_price: int) -> int:
+    """
+    Рассчитывает пропорциональную цену за остаток месяца
+    """
+    days_left = await get_remaining_days_until_next_payment(session, user_id)
+    
+    if days_left <= 0:
+        return base_price
+    
+    # Стандартный месяц = 30 дней
+    standard_month = 30
+    ratio = days_left / standard_month
+    
+    # Пропорциональная цена (округляем вниз до рублей)
+    prorated_price = int(base_price * ratio)
+    
+    # Минимальная цена - 1 рубль (чтобы не было бесплатно)
+    return max(1, prorated_price)
+
 # Обработка пользователей
 
 async def get_or_create_user(
@@ -268,47 +301,21 @@ async def calculate_monthly_price(session: AsyncSession, user_id: int) -> int:
     
     return total_price
 
-# async def create_client_config_with_payment(
-#     session: AsyncSession, 
-#     user_id: int, 
-#     config_number: int,
-#     config_name: str,
-#     vless_link: str,
-#     subscription_id: int,
-#     paid_until: datetime
-# ) -> ClientConfig:
-#     """Создать новый конфиг с привязкой к подписке"""
-#     config = ClientConfig(
-#         user_id=user_id,
-#         config_number=config_number,
-#         config_name=config_name,
-#         vless_link=vless_link,
-#         is_active=True,
-#         subscription_id=subscription_id,
-#         paid_until=paid_until
-#     )
-#     session.add(config)
-#     await session.commit()
-#     await session.refresh(config)
+async def extend_all_configs_paid_until(session: AsyncSession, user_id: int, months: int):
+    """
+    Продлевает paid_until для всех активных конфигов пользователя
+    """
+    configs = await get_user_configs(session, user_id)
+    days_to_add = months * 30
     
-#     # Обновляем количество активных конфигов в подписке
-#     subscription = await get_user_subscription(session, user_id)
-#     if subscription:
-#         subscription.active_configs_count = await get_active_configs_count(session, user_id)
-#         await session.commit()
+    for config in configs:
+        if config.paid_until:
+            config.paid_until += timedelta(days=days_to_add)
+        else:
+            config.paid_until = datetime.now() + timedelta(days=days_to_add)
     
-#     return config
-
-
-# async def update_subscription_price(session: AsyncSession, user_id: int):
-#     """Обновить стоимость подписки на основе количества конфигов"""
-#     subscription = await get_user_subscription(session, user_id)
-#     if subscription:
-#         configs_count = await get_active_configs_count(session, user_id)
-#         subscription.active_configs_count = configs_count
-#         await session.commit()
-
-
+    await session.commit()
+    
 async def get_next_config_number(session: AsyncSession, user_id: int) -> int:
     """Получить следующий номер конфига для пользователя"""
     stmt = select(ClientConfig).where(
