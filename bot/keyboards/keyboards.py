@@ -2,6 +2,7 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.config import config 
+from bot.utils.helpers import format_months, format_price
 
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
@@ -15,7 +16,6 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# bot/keyboards/keyboards.py
 def get_extend_payment_keyboard(user_id: int, configs_count: int) -> InlineKeyboardMarkup:
     """Клавиатура для выбора количества месяцев продления"""
     builder = InlineKeyboardBuilder()
@@ -38,10 +38,10 @@ def get_extend_payment_keyboard(user_id: int, configs_count: int) -> InlineKeybo
     # 12 месяцев - 15% скидка
     price_12_months = int(monthly_price * 12 * 0.85)
     
-    builder.button(text=f"1 месяц ({price_1_month}₽)", callback_data="extend_1_month")
-    builder.button(text=f"3 месяца ({price_3_months}₽)", callback_data="extend_3_months")
-    builder.button(text=f"6 месяцев ({price_6_months}₽)", callback_data="extend_6_months")
-    builder.button(text=f"12 месяцев ({price_12_months}₽)", callback_data="extend_12_months")
+    builder.button(text=f"1 месяц ({format_price(price_1_month)})", callback_data="extend_1_month")
+    builder.button(text=f"3 месяца ({format_price(price_3_months)})", callback_data="extend_3_months")
+    builder.button(text=f"6 месяцев ({format_price(price_6_months)})", callback_data="extend_6_months")
+    builder.button(text=f"12 месяцев ({format_price(price_12_months)})", callback_data="extend_12_months")
     builder.button(text="❌ Отмена", callback_data="payment_cancel")
     builder.adjust(1)
     return builder.as_markup()

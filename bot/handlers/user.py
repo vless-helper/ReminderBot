@@ -103,8 +103,10 @@ async def buy_subscription(message: Message):
             )
             return
         
+        monthly_price = await crud.calculate_monthly_price(session, user.id)
+        
         price_info = (
-            f"💰 Стоимость подписки: {config.BASE_PRICE}₽\n\n"
+            f"💰 Стоимость подписки: {monthly_price}₽\n\n"
             f"📥 Скачать Amnesia: {config.AMNESIA_DOWNLOAD_LINK}\n\n"
             f"🔧 Инструкция по настройке туннеля:\n{config.TUNNEL_INSTRUCTION}\n\n"
             f"💳 Оплата:\n"
@@ -224,6 +226,8 @@ async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer("❌ Ошибка!")
             return
         
+        monthly_price = await crud.calculate_monthly_price(session, user.id)
+
         # Создаем запись о платеже
         payment = await crud.create_payment(session, user.id, status="pending")
         
@@ -246,6 +250,7 @@ async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
         await callback.bot.send_message(
             admin_id,
             f"💰 НОВЫЙ ПЛАТЕЖ ({payment_type.upper()})!\n\n"
+            f"Сумма: {monthly_price}₽\n\n"
             f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
             f"ID: {callback.from_user.id}\n"
             f"Тип: {payment_type}\n\n"
@@ -304,14 +309,17 @@ async def check_subscription(message: Message):
             return
         
         has_subscription = await crud.check_subscription_status(session, user.id)
+
+        monthly_price = await crud.calculate_monthly_price(session, user.id)
         
         if has_subscription:
             subscription = await crud.get_user_subscription(session, user.id)
             days_left = (subscription.next_payment - datetime.now()).days + 1
             await message.answer(
                 f"✅ Подписка активна!\n\n"
-                f"📅 Следующее списание: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
-                f"⏰ Осталось дней: {days_left}"
+                f"📅 Подписка будет заморожена: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
+                f"Сумма списания: {monthly_price}₽\n"
+                f"⏰ Осталось дней: {days_left - 1}"
             )
         else:
             await message.answer(

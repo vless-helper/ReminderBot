@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 import html
 from datetime import datetime, timedelta
 
+from bot.utils.helpers import decline_months, format_months, format_price, format_date
 from bot.utils.admin_utils import require_admin, get_args
 from bot.config import config 
 from bot.db import crud
@@ -85,7 +86,7 @@ async def confirm_payment(callback: CallbackQuery):
                     user_id,
                     f"✅ Новый конфиг #{next_number} создан!\n\n"
                     f"🔗 VLESS ссылка:\n{vless_link}\n\n"
-                    f"📅 Оплачен до: {paid_until.strftime('%d.%m.%Y')}\n\n"
+                    f"📅 Оплачен до: {format_date(paid_until)}\n\n"
                     f"Сохраните ссылку в надежном месте."
                 )
                 
@@ -198,8 +199,8 @@ async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=None)
     
     await callback.message.answer(
-        f"✅ Спасибо! Вы выбрали продление на {months} месяц(ев).\n"
-        f"Сумма к оплате: {amount}₽\n\n"
+        f"✅ Спасибо! Вы выбрали продление на {format_months(months, with_number=True)}.\n"
+        f"Сумма к оплате: {format_price(amount)}\n\n"
         f"Я отправил уведомление администратору.\n"
         f"Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
     )
@@ -207,7 +208,7 @@ async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
     for admin_id in config.ADMIN_IDS:
         await callback.bot.send_message(
             admin_id,
-            f"💰 НОВЫЙ ПЛАТЕЖ (ПРОДЛЕНИЕ НА {months} МЕСЯЦЕВ)!\n\n"
+            f"💰 Новый платеж (продление на {format_months(months, with_number=True)})!\n\n"
             f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
             f"ID: {callback.from_user.id}\n"
             f"Месяцев: {months}\n"
@@ -247,36 +248,29 @@ async def confirm_extend_payment(callback: CallbackQuery):
 
         # Продлеваем paid_until для всех конфигов
         await crud.extend_all_configs_paid_until(session, user.id, months)
-
-        username = f"user_{user_id}"
-        await admin_api.create_user(username)
-        vless_link = await admin_api.get_vless_link(username)
         
-        await callback.answer(f"✅ Оплата на {months} месяц(ев) подтверждена!", show_alert=True)
+        # Получаем все конфиги пользователя
+        configs = await crud.get_user_configs(session, user.id)
+        
+        await callback.answer(f"✅ Оплата на {format_months(months, with_number=False)} подтверждена!", show_alert=True)
         
         # Удаляем клавиатуру
         await callback.message.edit_reply_markup(reply_markup=None)
         
         # Уведомляем пользователя
-        if vless_link:
+        if configs:
+            # Отправляем информацию о продлении
             await callback.bot.send_message(
                 user_id,
                 f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
-                f"🔗 Ваш VLESS конфиг:\n`{vless_link}`\n\n"
-                f"📱 Инструкция:\n"
-                f"1. Скачайте Amnesia\n"
-                f"2. Нажмите 'Импорт из буфера обмена'\n"
-                f"3. Вставьте ссылку\n\n"
-                f"Спасибо за покупку!",
-                parse_mode="Markdown"
+                f"Подписка продлена на {format_months(months, with_number=False)}.\n\n"
             )
         else:
             await callback.bot.send_message(
                 user_id,
                 f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка продлена на {months} месяц(ев).\n\n"
-                "Спасибо за покупку!"
+                f"Подписка продлена на {format_months(months, with_number=False)}.\n\n"
+                f"Спасибо за покупку!"
             )
 
 #API
