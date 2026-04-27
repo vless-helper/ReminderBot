@@ -3,10 +3,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload 
 from datetime import datetime, timedelta
 from typing import Optional, List
-from bot.db.models import ClientConfig
 from bot.config import config
 
-from .models import User, Subscription, Payment
+from .models import User, Subscription, Payment, ClientConfig
 
 # Обработка подписок
 
@@ -315,7 +314,7 @@ async def extend_all_configs_paid_until(session: AsyncSession, user_id: int, mon
             config.paid_until = datetime.now() + timedelta(days=days_to_add)
     
     await session.commit()
-    
+
 async def get_next_config_number(session: AsyncSession, user_id: int) -> int:
     """Получить следующий номер конфига для пользователя"""
     stmt = select(ClientConfig).where(
@@ -336,7 +335,8 @@ async def create_client_config(
     config_number: int,
     config_name: str,
     vless_link: str,
-    is_protected: bool = False
+    is_protected: bool = False,
+    paid_until: Optional[datetime] = None 
 ) -> ClientConfig:
     """Создать новый конфиг для пользователя"""
     config = ClientConfig(
@@ -345,7 +345,8 @@ async def create_client_config(
         config_name=config_name,
         vless_link=vless_link,
         is_active=True,
-        is_protected=is_protected  # флаг защиты
+        is_protected=is_protected,
+        paid_until=paid_until  
     )
     session.add(config)
     await session.commit()
