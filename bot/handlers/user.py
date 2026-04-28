@@ -95,7 +95,7 @@ async def buy_subscription(message: Message):
         
         if has_subscription:
             subscription = await crud.get_user_subscription(session, user.id)
-            days_left = (subscription.next_payment - datetime.now()).days
+            days_left = (subscription.next_payment - datetime.now()).days + 1
             await message.answer(
                 f"✅ У вас уже есть активная подписка!\n"
                 f"Осталось дней: {days_left}\n\n"
@@ -155,61 +155,6 @@ async def ask_question(message: Message, state: FSMContext):
         reply_markup=get_question_keyboard()
     )
     await state.set_state(QuestionState.waiting_for_question)
-
-@router.message(F.text == "ℹ️ Моя подписка")
-async def check_subscription(message: Message):
-    """Проверка статуса подписки"""
-    async with message.bot.get_db_session() as session:
-        user = await crud.get_user_by_telegram_id(session, message.from_user.id)
-        if not user:
-            await message.answer("❌ Ошибка! Попробуйте /start")
-            return
-        
-        has_subscription = await crud.check_subscription_status(session, user.id)
-        
-        if has_subscription:
-            subscription = await crud.get_user_subscription(session, user.id)
-            days_left = (subscription.next_payment - datetime.now()).days + 1
-            await message.answer(
-                f"✅ Подписка активна!\n\n"
-                f"📅 Следующее списание: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
-                f"⏰ Осталось дней: {days_left}"
-            )
-        else:
-            await message.answer(
-                "❌ У вас нет активной подписки.\n\n"
-                "Для покупки нажмите кнопку 'Купить подписку'"
-            )
-
-@router.callback_query(F.data == "one-month_payment")
-async def extend_one_month_payment(callback: CallbackQuery, state: FSMContext):
-    """Пользователь продлил подписку на один месяц"""
-    await callback.message.edit_reply_markup(reply_markup=None)
-    
-    async with callback.bot.get_db_session() as session:
-        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
-        if user:
-            payment = await crud.create_payment(session, user.id, status="pending", amount=config.BASE_PRICE, months=1)
-            await state.update_data(payment_id=payment.id)
-    
-    await callback.message.answer(
-        "✅ Спасибо! Я отправил уведомление администратору.\n"
-        "Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
-    )
-    
-    for admin_id in config.ADMIN_IDS:
-        await callback.bot.send_message(
-            admin_id,
-            f"💰 Новый платеж!\n\n"
-            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
-            f"ID: {callback.from_user.id}\n"
-            f"Сумма: {config.BASE_PRICE}₽\n\n"
-            f"Проверьте банк и подтвердите оплату.",
-            reply_markup=get_admin_keyboard(callback.from_user.id)
-        )
-    
-    await callback.answer()
-
 
 @router.callback_query(F.data == "payment_confirmed")
 async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
@@ -318,8 +263,8 @@ async def check_subscription(message: Message):
             await message.answer(
                 f"✅ Подписка активна!\n\n"
                 f"📅 Подписка будет заморожена: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
-                f"Сумма списания: {monthly_price}₽\n"
-                f"⏰ Осталось дней: {days_left - 1}"
+                f"Сумма к оплате: {monthly_price}₽\n"
+                f"⏰ Осталось дней: {days_left}"
             )
         else:
             await message.answer(

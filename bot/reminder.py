@@ -27,9 +27,9 @@ async def send_reminder_3days(bot: Bot, subscription, days_left: int):
             subscription.user.telegram_id,
             f"⚠️ Напоминание!\n\n"
             f"Ваша подписка истекает через {days_left + 1} дня(ей).\n"
-            f"Дата окончания: {subscription.next_payment.strftime('%d.%m.%Y')}\n\n"
-            f"Пожалуйста, продлите подписку, чтобы не потерять доступ.\n\n"
-            f"Для продления нажмите /start"
+            f"Дата блокировки: {subscription.next_payment.strftime('%d.%m.%Y')}\n\n"
+            f"Пожалуйста, продлите подписку до этого времени, чтобы не потерять доступ.\n\n"
+            f"Для продления нажмите 'Продлить подписку'"
         )
         logger.info(f"Напоминание за {days_left} дня отправлено пользователю {subscription.user.telegram_id}")
         return True
@@ -49,7 +49,7 @@ async def send_reminder_1day(bot: Bot, subscription):
             f"⚠️ Срочное напоминание!\n\n"
             f"ЗАВТРА ({expire_time_str}) ваша подписка истекает!\n\n"
             f"Пожалуйста, продлите подписку сегодня, чтобы не потерять доступ.\n\n"
-            f"Для продления нажмите /start"
+            f"Для продления нажмите 'Продлить подписку'"
         )
         logger.info(f"Напоминание за 1 день отправлено пользователю {subscription.user.telegram_id}")
         return True
@@ -64,11 +64,13 @@ async def send_expired_today_reminder(bot: Bot, subscription, session):
         await bot.send_message(
             subscription.user.telegram_id,
             f"⏰ Внимание!\n\n"
-            f"Срок вашей подписки истек сегодня!\n"
-            f"Пожалуйста, продлите подписку для продолжения использования сервиса.\n\n"
-            f"Для продления нажмите /start"
+            f"Ваша подписка была заморожена!\n"
+            f"Оплатите подписку для продолжения использования сервиса.\n\n"
+            f"Для оплаты нажмите 'Купить подписку'"
         )
         logger.info(f"Уведомление об истечении отправлено пользователю {subscription.user.telegram_id}")
+
+
 
         # Исправлено: меняем статус через session, а не через subscription.session
         subscription.status = "expired"
