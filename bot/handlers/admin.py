@@ -251,6 +251,9 @@ async def confirm_extend_payment(callback: CallbackQuery):
         
         # Получаем все конфиги пользователя
         configs = await crud.get_user_configs(session, user.id)
+
+        for config in configs:
+            await admin_api.unarchive_user(config.config_name)
         
         await callback.answer(f"✅ Оплата на {format_months(months, with_number=False)} подтверждена!", show_alert=True)
         

@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 from bot.config import config
 
-from .models import User, Subscription, Payment, ClientConfig
+from bot.api.client import admin_api
+from bot.db.models import User, Subscription, Payment, ClientConfig
 
 # Обработка подписок
 
@@ -265,6 +266,50 @@ async def reset_reminder_flag(session: AsyncSession, subscription_id: int):
     )
     await session.execute(stmt)
     await session.commit()
+
+# Обработка конфигов
+
+async def get_expired_configs(session: AsyncSession) -> List[ClientConfig]:
+    """
+    Получить все конфиги, у которых истек срок оплаты
+    """
+    now = datetime.now()
+    stmt = select(ClientConfig).where(
+        ClientConfig.is_active == True,
+        ClientConfig.paid_until < now,
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def archive_expired_configs(session: AsyncSession) -> List[dict]:
+    """
+    Архивация просроченных конфигов
+    Возвращает список словарей с информацией об архивированных конфигах для отправки в админку
+    """
+    expired_congigs = await get_expired_configs(session)
+    archived_info = []
+
+    for config in expired_congigs:
+        success = await archive_config_in_admin(config.config_name)
+
+        if success:
+            config.is_active = False
+            archived_info.append({
+                'config_id': config.id,
+                'config_number': config.config_number,
+                'user_id': config.user_id, 
+                'config_name': config.config_name,
+                'telegram_id': None  # Заполним позже, когда загрузим пользователя
+            })
+
+        await session.commit()
+        return archived_info
+    
+async def archive_config_in_admin(config_name: str) -> bool:
+    """
+    Отправляет PATCH запрос в админку для архивации конфига
+    """
+    return admin_api.archive_user(config_name)
 
 # Операции с доп. конфигами 
 

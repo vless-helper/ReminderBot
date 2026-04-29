@@ -4,6 +4,7 @@ from datetime import datetime
 from aiogram import Bot
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
+from bot.api.client import admin_api
 from bot.config import config
 from bot.db import crud
 
@@ -76,6 +77,15 @@ async def send_expired_today_reminder(bot: Bot, subscription, session):
         subscription.status = "expired"
         await session.commit()
 
+        configs = await crud.get_user_configs(session, subscription.user_id)
+        archived_configs = 0
+
+        for config in configs:
+            success = await admin_api.archive_user(config.config_name)
+            if success:
+                archived_configs += 1
+                logger.info(f"Заархивированно {archived_configs} конфигов пользователя {subscription.user.telegram_id}")
+
         return True
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления об истечении: {e}")
@@ -114,7 +124,7 @@ async def check_and_send_reminders(bot: Bot):
             if success:
                 await crud.mark_reminder_sent(session, subscription.id)
         
-        # 3. Уведомления, что подписка истекла сегодня
+        # 3. Уведомления, что подписка истекла сегодня + архивирование конфигов
         expired_today = await crud.get_expired_today_subscriptions(session)
         
         for subscription in expired_today:

@@ -181,6 +181,48 @@ class AdminAPIClient:
                 logger.error(f"Ошибка соединения с админкой: {e}")
                 return False
     
+    async def archive_user(self, name: str) -> bool:
+        """
+        Архивировать пользователя в админке
+        PATCH /users/{name} с JSON {"archived": true}
+        """
+
+        url = f"{self.base_url}/users/{name}"
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.patch(url, json={"archived": True}, headers=self.headers) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Пользователь {name} успешно заблокирован в админке")
+                        return True
+                    else:
+                        logger.error(f"Ошибка при блокировке пользователя {name}: {resp.status} - {error}")
+                        return False                    
+            except Exception as e:
+                logger.error(f"Ошибка соединения с админкой: {e}")
+                return False
+
+    async def unarchive_user(self, name: str) -> bool:
+        """
+        Разархивировать пользователя в админке
+        PATCH /users/{name} с JSON {"archived": false}
+        """
+
+        url = f"{self.base_url}/users/{name}"
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.patch(url, json={"archived": False}, headers=self.headers) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Пользователь {name} успешно разблокирован в админке")
+                        return True
+                    else:
+                        logger.error(f"Ошибка при разблокировке пользователя {name}: {resp.status} - {error}")
+                        return False                    
+            except Exception as e:
+                logger.error(f"Ошибка соединения с админкой: {e}")
+                return False
+
     async def health_check(self) -> bool:
         """Проверка доступности админки"""
         url = f"{self.base_url}/health"
