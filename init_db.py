@@ -1,27 +1,14 @@
 import asyncio
-import sys
-import os
-
-# Добавляем текущую директорию в путь
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from bot.db.base import create_engine_and_session
+from sqlalchemy.ext.asyncio import create_async_engine
 from bot.db.models import Base
 from bot.config import config
 
-async def init_database():
-    """Инициализация базы данных - создание всех таблиц"""
-    print(f"Подключение к БД: {config.DATABASE_URL}")
-    
-    engine, _ = create_engine_and_session(config.DATABASE_URL)
-    
+async def init_db():
+    engine = create_async_engine(config.DATABASE_URL, echo=True)
     async with engine.begin() as conn:
-        # Создаем все таблицы
         await conn.run_sync(Base.metadata.create_all)
-        print("✅ Таблицы успешно созданы!")
-    
     await engine.dispose()
-    print("✅ Инициализация БД завершена!")
+    print("✅ Таблицы созданы!")
 
 if __name__ == "__main__":
-    asyncio.run(init_database())
+    asyncio.run(init_db())

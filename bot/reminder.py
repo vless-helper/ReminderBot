@@ -62,16 +62,17 @@ async def send_reminder_1day(bot: Bot, subscription):
 async def send_expired_today_reminder(bot: Bot, subscription, session):
     """Отправить уведомление, что подписка истекла сегодня"""
     try:
+        expire_time = subscription.next_payment
+        expire_time_str = expire_time.strftime('%d.%m.%Y в %H:%M')
+
         await bot.send_message(
             subscription.user.telegram_id,
             f"⏰ Внимание!\n\n"
-            f"Ваша подписка была заморожена!\n"
+            f"Срок вашей подписки истек {expire_time_str}!\n"
             f"Оплатите подписку для продолжения использования сервиса.\n\n"
             f"Для оплаты нажмите 'Купить подписку'"
         )
         logger.info(f"Уведомление об истечении отправлено пользователю {subscription.user.telegram_id}")
-
-
 
         # Исправлено: меняем статус через session, а не через subscription.session
         subscription.status = "expired"
@@ -80,11 +81,13 @@ async def send_expired_today_reminder(bot: Bot, subscription, session):
         configs = await crud.get_user_configs(session, subscription.user_id)
         archived_configs = 0
 
-        for config in configs:
-            success = await admin_api.archive_user(config.config_name)
+        for cfg in configs:
+            success = await admin_api.archive_user(cfg.config_name)
             if success:
                 archived_configs += 1
                 logger.info(f"Заархивированно {archived_configs} конфигов пользователя {subscription.user.telegram_id}")
+
+        await crud.mark_reminder_sent(session, subscription.id)
 
         return True
     except Exception as e:

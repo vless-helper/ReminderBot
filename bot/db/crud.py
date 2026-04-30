@@ -137,7 +137,7 @@ async def get_remaining_days_until_next_payment(session: AsyncSession, user_id: 
     if not subscription or subscription.next_payment <= datetime.now():
         return 0
     
-    days_left = (subscription.next_payment - datetime.now()).days
+    days_left = (subscription.next_payment - datetime.now()).days + 1
     return max(0, days_left)
 
 
@@ -231,21 +231,36 @@ async def get_expiring_tomorrow_subscriptions(session: AsyncSession) -> List[Sub
     return result.scalars().all()
 
 async def get_expired_today_subscriptions(session: AsyncSession) -> List[Subscription]:
-    """Получить подписки, истекшие сегодня"""
-    today = datetime.now().date()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    end_of_day = datetime.combine(today, datetime.max.time())
+    """Получить подписки, истекшие сегодня в конкретное время"""
+    now = datetime.now()
     
     stmt = select(Subscription).options(
         selectinload(Subscription.user)
     ).where(
         and_(
             Subscription.status == "active",
-            Subscription.next_payment.between(start_of_day, end_of_day)
+            Subscription.next_payment <= now
         )
     )
     result = await session.execute(stmt)
     return result.scalars().all()
+
+# async def get_expired_today_subscriptions(session: AsyncSession) -> List[Subscription]:
+#     """Получить подписки, истекшие сегодня"""
+#     today = datetime.now().date()
+#     start_of_day = datetime.combine(today, datetime.min.time())
+#     end_of_day = datetime.combine(today, datetime.max.time())
+    
+#     stmt = select(Subscription).options(
+#         selectinload(Subscription.user)
+#     ).where(
+#         and_(
+#             Subscription.status == "active",
+#             Subscription.next_payment.between(start_of_day, end_of_day)
+#         )
+#     )
+#     result = await session.execute(stmt)
+#     return result.scalars().all()
 
 async def mark_reminder_sent(session: AsyncSession, subscription_id: int):
     """Отметить, что напоминание отправлено"""
@@ -343,6 +358,9 @@ async def calculate_monthly_price(session: AsyncSession, user_id: int) -> int:
     if configs_count >= 10:
         total_price = int(total_price * 0.9)  # 10% скидка от 10 конфигов
     
+    if total_price == 0:
+        total_price = base_price 
+
     return total_price
 
 async def extend_all_configs_paid_until(session: AsyncSession, user_id: int, months: int):

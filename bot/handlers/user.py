@@ -18,7 +18,8 @@ from bot.keyboards.keyboards import (
     get_admin_keyboard, 
     get_extend_payment_keyboard, 
     get_configs_keyboard, 
-    get_config_actions_keyboard
+    get_config_actions_keyboard,
+    get_admin_extend_keyboard
 )
 from bot.config import config
 from bot.api.client import admin_api
@@ -95,7 +96,7 @@ async def buy_subscription(message: Message):
         
         if has_subscription:
             subscription = await crud.get_user_subscription(session, user.id)
-            days_left = (subscription.next_payment - datetime.now()).days + 1
+            days_left = (subscription.next_payment - datetime.now()).days
             await message.answer(
                 f"✅ У вас уже есть активная подписка!\n"
                 f"Осталось дней: {days_left}\n\n"
@@ -156,14 +157,19 @@ async def ask_question(message: Message, state: FSMContext):
     )
     await state.set_state(QuestionState.waiting_for_question)
 
+# bot/handlers/user.py
 @router.callback_query(F.data == "payment_confirmed")
 async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
-    """Пользователь подтвердил оплату (может быть оплата подписки или нового конфига)"""
+    """Пользователь подтвердил оплату (подписка или продление)"""
     await callback.message.edit_reply_markup(reply_markup=None)
     
-    # Проверяем, есть ли данные о создании нового конфига
     state_data = await state.get_data()
-    is_new_config = state_data.get("new_config_number") is not None
+    payment_type = state_data.get("payment_type", "subscription")
+    is_extend = state_data.get("is_extend", False)
+    extend_months = state_data.get("extend_months", None)
+    extend_amount = state_data.get("extend_amount", None)
+    is_new_config = state_data.get("is_new_config", False)
+    new_config_number = state_data.get("new_config_number", None)
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
@@ -171,37 +177,55 @@ async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer("❌ Ошибка!")
             return
         
-        monthly_price = await crud.calculate_monthly_price(session, user.id)
-
         # Создаем запись о платеже
-        payment = await crud.create_payment(session, user.id, status="pending")
-        
-        if is_new_config:
-            # Это оплата нового конфига
-            await state.update_data(payment_id=payment.id, is_new_config=True)
-            payment_type = "нового конфига"
+        if is_extend:
+            payment = await crud.create_payment(
+                session, user.id, status="pending", 
+                amount=extend_amount, months=extend_months
+            )
+        elif is_new_config:
+            payment = await crud.create_payment(session, user.id, status="pending")
         else:
-            # Это оплата подписки
-            await state.update_data(payment_id=payment.id)
-            payment_type = "подписки"
+            payment = await crud.create_payment(session, user.id, status="pending")
+        
+        # Сохраняем тип платежа в состояние
+        await state.update_data(
+            payment_id=payment.id,
+            payment_type="extend" if is_extend else ("new_config" if is_new_config else "subscription"),
+            extend_months=extend_months,
+            extend_amount=extend_amount
+        )
+    
+    payment_type_text = "продления" if is_extend else ("нового конфига" if is_new_config else "подписки")
     
     await callback.message.answer(
-        f"✅ Спасибо! Я отправил уведомление администратору об оплате {payment_type}.\n"
+        f"✅ Спасибо! Я отправил уведомление администратору об оплате {payment_type_text}.\n"
         "Ожидайте подтверждения. Обычно это занимает до 30 минут."
     )
     
-    # Отправляем уведомление админу
+    # Отправляем уведомление админу с соответствующей клавиатурой
     for admin_id in config.ADMIN_IDS:
-        await callback.bot.send_message(
-            admin_id,
-            f"💰 НОВЫЙ ПЛАТЕЖ ({payment_type.upper()})!\n\n"
-            f"Сумма: {monthly_price}₽\n\n"
-            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
-            f"ID: {callback.from_user.id}\n"
-            f"Тип: {payment_type}\n\n"
-            f"Проверьте банк и подтвердите оплату.",
-            reply_markup=get_admin_keyboard(callback.from_user.id, is_new_config=is_new_config)
-        )
+        if payment_type == "extend":
+            await callback.bot.send_message(
+                admin_id,
+                f"💰 НОВЫЙ ПЛАТЕЖ (ПРОДЛЕНИЕ)!\n\n"
+                f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+                f"ID: {callback.from_user.id}\n"
+                f"Месяцев: {extend_months}\n"
+                f"Сумма: {extend_amount}₽\n\n"
+                f"Проверьте банк и подтвердите оплату.",
+                reply_markup=get_admin_extend_keyboard(callback.from_user.id, extend_months, extend_amount)
+            )
+        else:
+            await callback.bot.send_message(
+                admin_id,
+                f"💰 НОВЫЙ ПЛАТЕЖ ({payment_type_text.upper()})!\n\n"
+                f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+                f"ID: {callback.from_user.id}\n"
+                f"Сумма: {config.SUBSCRIPTION_PRICE}₽\n\n"
+                f"Проверьте банк и подтвердите оплату.",
+                reply_markup=get_admin_keyboard(callback.from_user.id, is_new_config=is_new_config)
+            )
     
     await callback.answer()
 
@@ -259,7 +283,7 @@ async def check_subscription(message: Message):
         
         if has_subscription:
             subscription = await crud.get_user_subscription(session, user.id)
-            days_left = (subscription.next_payment - datetime.now()).days + 1
+            days_left = (subscription.next_payment - datetime.now()).days 
             await message.answer(
                 f"✅ Подписка активна!\n\n"
                 f"📅 Подписка будет заморожена: {subscription.next_payment.strftime('%d.%m.%Y')}\n"
@@ -324,6 +348,7 @@ async def my_configs(message: Message):
         await message.answer(text, reply_markup=keyboard)
 
 
+# bot/handlers/user.py
 @router.callback_query(F.data == "create_new_config")
 async def create_new_config(callback: CallbackQuery, state: FSMContext):
     """Создать новый конфиг (требует оплаты)"""
@@ -345,18 +370,20 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
         
         # Получаем следующий номер конфига
         next_number = await crud.get_next_config_number(session, user.id)
-        # Получаем остаток дней до основного платежа
+        
+        # Получаем остаток дней до следующего платежа
         days_left = await crud.get_remaining_days_until_next_payment(session, user.id)
-        # Базовая цена за конфиг
+        
+        # Стандартная цена за конфиг
         base_config_price = config.BASE_PRICE
-
+        
         # Рассчитываем пропорциональную цену
         if days_left > 0:
             standard_month = 30
-            ratio = days_left / standard_month
+            ratio = (days_left) / standard_month
             prorated_price = int(base_config_price * ratio)
             new_config_price = max(1, prorated_price)
-        
+            
             price_explanation = (
                 f"📅 До следующего платежа осталось {days_left} дней.\n"
                 f"💰 Плата за новый конфиг составит {new_config_price}₽ "
@@ -365,13 +392,13 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
             )
         else:
             new_config_price = base_config_price
-            price_explanation = "💰 Оплата за полный месяц."
+            price_explanation = f"💰 Оплата за полный месяц."
         
-        # Сохраняем в состояние
+        # СОХРАНЯЕМ В СОСТОЯНИЕ - это важно!
         await state.update_data(
+            is_new_config=True,  # <-- ключевой флаг
             new_config_number=next_number,
-            new_config_price=new_config_price,
-            new_config_prorated=days_left > 0
+            new_config_price=new_config_price
         )
         
         await callback.message.answer(

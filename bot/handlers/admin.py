@@ -9,7 +9,7 @@ from bot.utils.helpers import decline_months, format_months, format_price, forma
 from bot.utils.admin_utils import require_admin, get_args
 from bot.config import config 
 from bot.db import crud
-from bot.keyboards.keyboards import get_admin_extend_keyboard
+from bot.keyboards.keyboards import get_admin_extend_keyboard, get_payment_keyboard
 from bot.api.client import admin_api
 
 router = Router()
@@ -40,7 +40,7 @@ async def answer_question(message: Message):
         await message.answer("❌ Неверный формат ID пользователя")
 
 @router.callback_query(F.data.startswith("confirm_payment_"))
-async def confirm_payment(callback: CallbackQuery):
+async def confirm_payment(callback: CallbackQuery, state: FSMContext):
     """Подтверждение оплаты (подписки или нового конфига)"""
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("⛔ У вас нет прав", show_alert=True)
@@ -48,7 +48,14 @@ async def confirm_payment(callback: CallbackQuery):
     
     parts = callback.data.split("_")
     user_id = int(parts[2])
-    is_new_config = len(parts) > 3 and parts[3] == "new"
+    
+    # Получаем данные из состояния
+    state_data = await state.get_data()
+    is_new_config = state_data.get("is_new_config", False)
+    new_config_number = state_data.get("new_config_number", None)
+    payment_type = state_data.get("payment_type", "subscription")
+    extend_months = state_data.get("extend_months", None)
+    extend_amount = state_data.get("extend_amount", None)
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, user_id)
@@ -61,10 +68,29 @@ async def confirm_payment(callback: CallbackQuery):
         if payment:
             await crud.update_payment_status(session, payment.id, "completed")
         
-        if is_new_config:
-            # Получаем следующий номер конфига
-            next_number = await crud.get_next_config_number(session, user.id)
-            config_name = f"user_{user_id}_{next_number}"
+        if payment_type == "extend" and extend_months:
+            # ПРОДЛЕНИЕ ПОДПИСКИ
+            await crud.extend_subscription_months(session, user.id, extend_months)
+            await crud.extend_all_configs_paid_until(session, user.id, extend_months)
+            
+            # Разархивируем конфиги
+            configs = await crud.get_user_configs(session, user.id)
+            for cfg in configs:
+                await admin_api.unarchive_user(cfg.config_name)
+            
+            await callback.bot.send_message(
+                user_id,
+                f"✅ Ваша оплата подтверждена!\n"
+                f"Подписка продлена на {format_months(extend_months)}.\n\n"
+                f"📱 Ваши конфиги снова активны.\n\n"
+                f"Спасибо за покупку!"
+            )
+            await callback.answer(f"✅ Продление на {extend_months} мес. подтверждено!", show_alert=True)
+            
+        elif payment_type == "new_config" and new_config_number:
+
+            # СОЗДАНИЕ НОВОГО КОНФИГА
+            config_name = f"user_{user_id}_{new_config_number}"
             
             # Создаем конфиг в админке
             vless_link = await admin_api.create_user_and_get_config(config_name)
@@ -78,23 +104,27 @@ async def confirm_payment(callback: CallbackQuery):
                 
                 # Сохраняем конфиг в БД
                 new_config = await crud.create_client_config(
-                    session, user.id, next_number, config_name, vless_link,
+                    session, user.id, new_config_number, config_name, vless_link,
                     is_protected=False, paid_until=paid_until
                 )
                 
                 await callback.bot.send_message(
                     user_id,
-                    f"✅ Новый конфиг #{next_number} создан!\n\n"
+                    f"✅ Новый конфиг #{new_config_number} создан!\n\n"
                     f"🔗 VLESS ссылка:\n{vless_link}\n\n"
                     f"📅 Оплачен до: {format_date(paid_until)}\n\n"
                     f"Сохраните ссылку в надежном месте."
                 )
                 
-                await callback.answer(f"✅ Конфиг #{next_number} создан!", show_alert=True)
+                await callback.answer(f"✅ Конфиг #{new_config_number} создан!", show_alert=True)
             else:
                 await callback.answer("❌ Не удалось создать конфиг", show_alert=True)
+            
+            # Очищаем состояние
+            await state.clear()
+            
         else:
-            # Обычное продление подписки
+            # ПРОДЛЕНИЕ ПОДПИСКИ (не создаем новый конфиг)
             await crud.extend_subscription(session, user.id, config.SUBSCRIPTION_DAYS)
             
             # Проверяем, есть ли уже конфиги у пользователя
@@ -110,8 +140,11 @@ async def confirm_payment(callback: CallbackQuery):
                 
                 if vless_link:
                     # Сохраняем конфиг в БД
+                    paid_until = datetime.now() + timedelta(days=config.SUBSCRIPTION_DAYS)
+                    
                     new_config = await crud.create_client_config(
-                        session, user.id, config_number, config_name, vless_link, is_protected=True
+                        session, user.id, config_number, config_name, vless_link, 
+                        is_protected=True, paid_until=paid_until
                     )
                     
                     await callback.bot.send_message(
@@ -129,11 +162,16 @@ async def confirm_payment(callback: CallbackQuery):
                         f"⚠️ Конфиг будет создан автоматически позже."
                     )
             else:
-                # У пользователя уже есть конфиги
+                # У пользователя уже есть конфиги - просто продлеваем
+                # Разархивируем все конфиги
+                for cfg in existing_configs:
+                    await admin_api.unarchive_user(cfg.config_name)
+                
                 await callback.bot.send_message(
                     user_id,
                     f"✅ Ваша оплата подтверждена!\n"
-                    f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
+                    f"Подписка продлена на {config.SUBSCRIPTION_DAYS} дней.\n\n"
+                    f"📱 Ваши конфиги снова активны.\n\n"
                     f"Спасибо за покупку!"
                 )
             
@@ -165,11 +203,15 @@ async def reject_payment(callback: CallbackQuery):
             "Пожалуйста, свяжитесь с администратором для уточнения деталей."
         )
 
+# bot/handlers/admin.py
 @router.callback_query(F.data.startswith("extend_"))
 async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано количество месяцев для продления"""
     parts = callback.data.split("_")
     months = int(parts[1])
+    amount = None
+    if len(parts) > 2 and parts[2].isdigit():
+        amount = int(parts[2])
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
@@ -177,45 +219,39 @@ async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
             await callback.answer("❌ Пользователь не найден", show_alert=True)
             return
         
-        # Получаем месячную цену (базовая цена * количество конфигов)
-        monthly_price = await crud.calculate_monthly_price(session, user.id)
+        # Получаем месячную цену если не передана
+        if not amount:
+            monthly_price = await crud.calculate_monthly_price(session, user.id)
+            if months == 1:
+                amount = monthly_price
+            elif months == 3:
+                amount = int(monthly_price * 3 * 0.95)
+            elif months == 6:
+                amount = int(monthly_price * 6 * 0.9)
+            elif months == 12:
+                amount = int(monthly_price * 12 * 0.85)
+            else:
+                amount = monthly_price * months
         
-        # Рассчитываем цену в зависимости от количества месяцев
-        if months == 1:
-            amount = monthly_price
-        elif months == 3:
-            amount = int(monthly_price * 3 * 0.95)  # 5% скидка
-        elif months == 6:
-            amount = int(monthly_price * 6 * 0.9)   # 10% скидка
-        elif months == 12:
-            amount = int(monthly_price * 12 * 0.85) # 15% скидка
-        else:
-            amount = monthly_price * months
-        
-        # Создаем платеж
-        payment = await crud.create_payment(session, user.id, status="pending", amount=amount, months=months)
-        await state.update_data(payment_id=payment.id, months=months, amount=amount)
+        # Сохраняем данные о продлении в состояние
+        await state.update_data(
+            extend_months=months,
+            extend_amount=amount,
+            is_extend=True  # флаг, что это продление
+        )
     
     await callback.message.edit_reply_markup(reply_markup=None)
     
+    # Отправляем информацию об оплате с кнопкой "Я оплатил(а)"
     await callback.message.answer(
-        f"✅ Спасибо! Вы выбрали продление на {format_months(months, with_number=True)}.\n"
-        f"Сумма к оплате: {format_price(amount)}\n\n"
-        f"Я отправил уведомление администратору.\n"
-        f"Ожидайте подтверждения оплаты. Обычно это занимает до 30 минут."
+        f"✅ Вы выбрали продление на {format_months(months)}.\n"
+        f"💰 Сумма к оплате: {format_price(amount)}\n\n"
+        f"💳 Реквизиты для оплаты:\n"
+        f"Карта: {config.CARD_NUMBER}\n"
+        f"Получатель: {config.CARD_HOLDER}\n\n"
+        f"❗️ После оплаты нажмите кнопку 'Я оплатил(а)'",
+        reply_markup=get_payment_keyboard()  # кнопка "Я оплатил(а)"
     )
-    
-    for admin_id in config.ADMIN_IDS:
-        await callback.bot.send_message(
-            admin_id,
-            f"💰 Новый платеж (продление на {format_months(months, with_number=True)})!\n\n"
-            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
-            f"ID: {callback.from_user.id}\n"
-            f"Месяцев: {months}\n"
-            f"Сумма: {amount}₽\n\n"
-            f"Проверьте банк и подтвердите оплату.",
-            reply_markup=get_admin_extend_keyboard(callback.from_user.id, months, amount)
-        )
     
     await callback.answer()
 
@@ -252,8 +288,8 @@ async def confirm_extend_payment(callback: CallbackQuery):
         # Получаем все конфиги пользователя
         configs = await crud.get_user_configs(session, user.id)
 
-        for config in configs:
-            await admin_api.unarchive_user(config.config_name)
+        for cfg in configs:
+            await admin_api.unarchive_user(cfg.config_name)
         
         await callback.answer(f"✅ Оплата на {format_months(months, with_number=False)} подтверждена!", show_alert=True)
         

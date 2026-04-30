@@ -8,13 +8,17 @@ from bot.utils.helpers import format_months, format_price
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     """Главная клавиатура"""
     buttons = [
-        [KeyboardButton(text="📦 Купить подписку")],
-        [KeyboardButton(text="🔄 Продлить подписку")],
-        [KeyboardButton(text="❓ Задать вопрос")],
-        [KeyboardButton(text="ℹ️ Моя подписка")],
-        [KeyboardButton(text="📱 Мои конфиги")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+            [KeyboardButton(text="📦 Купить подписку"), KeyboardButton(text="🔄 Продлить подписку"), KeyboardButton(text="❓ Задать вопрос")],
+            [KeyboardButton(text="ℹ️ Моя подписка"), KeyboardButton(text="📱 Мои конфиги")]
+        ]
+        
+    return ReplyKeyboardMarkup(
+        keyboard=buttons, 
+        resize_keyboard=True,  # Автоматически подгонять размер
+        one_time_keyboard=True,  # Скрывать после нажатия (раскомментировать если нужно)
+        input_field_placeholder="Выберите действие",  # Подсказка в поле ввода
+        # selective=True  # Показывать только определенным пользователям
+    )
 
 def get_extend_payment_keyboard(user_id: int, configs_count: int) -> InlineKeyboardMarkup:
     """Клавиатура для выбора количества месяцев продления"""
