@@ -387,7 +387,7 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
             price_explanation = (
                 f"📅 До следующего платежа осталось {days_left} дней.\n"
                 f"💰 Плата за новый конфиг составит {new_config_price}₽ "
-                f"(пропорционально остатку месяца).\n"
+                f"(пропорционально остатку платежного периода).\n"
                 f"При следующем продлении будет взиматься полная стоимость."
             )
         else:
