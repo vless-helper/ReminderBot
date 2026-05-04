@@ -58,12 +58,12 @@ class AdminAPIClient:
         success, status = await self.create_user(name)
         
         if not success:
+            logger.error(f"Ошибка создания пользователя: {status}")
             return None
         
         # Если пользователь уже существовал или создан - получаем конфиг
         vless_link = await self.get_vless_link(name)
         return vless_link
-
 
     async def get_or_create_user_config(self, name: str) -> Optional[str]:
         """
@@ -100,25 +100,6 @@ class AdminAPIClient:
                 logger.error(f"Ошибка соединения с админкой: {e}")
                 return None
     
-    async def get_singbox_config(self, name: str) -> Optional[Dict[str, Any]]:
-        """
-        Получить SingBox конфиг для пользователя
-        GET /users/{name}/singbox
-        """
-        url = f"{self.base_url}/users/{name}/singbox"
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, headers=self.headers) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        logger.error(f"Ошибка получения SingBox для {name}: {resp.status}")
-                        return None
-            except Exception as e:
-                logger.error(f"Ошибка соединения с админкой: {e}")
-                return None
-    
     async def get_user(self, name: str) -> Optional[Dict[str, Any]]:
         """
         Получить информацию о пользователе
@@ -139,27 +120,6 @@ class AdminAPIClient:
             except Exception as e:
                 logger.error(f"Ошибка соединения с админкой: {e}")
                 return None
-    
-    async def create_user_and_get_config(self, name: str) -> Optional[str]:
-        """
-        Создать пользователя и получить VLESS ссылку (удобный метод)
-        """
-        # Создаем пользователя
-        created = await self.create_user(name)
-        if not created:
-            return None
-        
-        # Получаем VLESS ссылку
-        vless_link = await self.get_vless_link(name)
-        return vless_link
-
-    async def create_user_with_number(self, base_name: str, number: int) -> tuple[bool, Optional[str], Optional[str]]:
-        """
-        Создать пользователя с номером конфига
-        Например: base_name = "user_1924089475", number = 1 -> "user_1924089475_1"
-        """
-        full_name = f"{base_name}_{number}"
-        return await self.create_user_and_get_config(full_name)
     
     async def delete_user(self, name: str) -> bool:
         """

@@ -127,8 +127,6 @@ async def create_payment(
     await session.refresh(payment)
     return payment
 
-from datetime import datetime, timedelta
-
 async def get_remaining_days_until_next_payment(session: AsyncSession, user_id: int) -> int:
     """
     Получает количество дней до следующего платежа
@@ -141,24 +139,24 @@ async def get_remaining_days_until_next_payment(session: AsyncSession, user_id: 
     return max(0, days_left)
 
 
-async def calculate_prorated_price(session: AsyncSession, user_id: int, base_price: int) -> int:
-    """
-    Рассчитывает пропорциональную цену за остаток месяца
-    """
-    days_left = await get_remaining_days_until_next_payment(session, user_id)
+# async def calculate_prorated_price(session: AsyncSession, user_id: int, base_price: int) -> int:
+#     """
+#     Рассчитывает пропорциональную цену за остаток месяца
+#     """
+#     days_left = await get_remaining_days_until_next_payment(session, user_id)
     
-    if days_left <= 0:
-        return base_price
+#     if days_left <= 0:
+#         return base_price
     
-    # Стандартный месяц = 30 дней
-    standard_month = 30
-    ratio = days_left / standard_month
+#     # Стандартный месяц = 30 дней
+#     standard_month = 30
+#     ratio = days_left / standard_month
     
-    # Пропорциональная цена (округляем вниз до рублей)
-    prorated_price = int(base_price * ratio)
+#     # Пропорциональная цена (округляем вниз до рублей)
+#     prorated_price = int(base_price * ratio)
     
-    # Минимальная цена - 1 рубль (чтобы не было бесплатно)
-    return max(1, prorated_price)
+#     # Минимальная цена - 1 рубль (чтобы не было бесплатно)
+#     return max(1, prorated_price)
 
 # Обработка пользователей
 
@@ -338,14 +336,18 @@ async def get_user_configs(session: AsyncSession, user_id: int) -> List[ClientCo
     
     result = await session.execute(stmt)
     configs = result.scalars().all()
+
     print(f"DEBUG get_user_configs: user_id={user_id}, найдено={len(configs)}")
+    
     for cfg in configs:
         print(f"  - id={cfg.id}, number={cfg.config_number}")
+    
     return configs
 
 async def get_active_configs_count(session: AsyncSession, user_id: int) -> int:
     """Получить количество активных конфигов пользователя"""
     configs = await get_user_configs(session, user_id)
+    
     return len(configs)
 
 async def calculate_monthly_price(session: AsyncSession, user_id: int) -> int:
