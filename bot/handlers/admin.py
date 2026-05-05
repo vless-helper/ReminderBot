@@ -152,7 +152,7 @@ async def confirm_payment(callback: CallbackQuery, state: FSMContext):
                         f"✅ Ваша оплата подтверждена!\n"
                         f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
                         f"🔗 Ваш первый конфиг:\n{vless_link}\n\n"
-                        f"📱 Инструкция по установке в Amnesia"
+                        f"📱 Инструкция по установке в Happ"
                     )
                 else:
                     await callback.bot.send_message(
@@ -203,7 +203,6 @@ async def reject_payment(callback: CallbackQuery):
             "Пожалуйста, свяжитесь с администратором для уточнения деталей."
         )
 
-# bot/handlers/admin.py
 @router.callback_query(F.data.startswith("extend_"))
 async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано количество месяцев для продления"""
@@ -233,11 +232,11 @@ async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
             else:
                 amount = monthly_price * months
         
-        # Сохраняем данные о продлении в состояние
         await state.update_data(
             extend_months=months,
             extend_amount=amount,
-            is_extend=True  # флаг, что это продление
+            is_extend=True,
+            payment_type="extend"  # <-- ДОБАВИТЬ ЭТУ СТРОКУ!
         )
     
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -250,7 +249,7 @@ async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
         f"Карта: {config.CARD_NUMBER}\n"
         f"Получатель: {config.CARD_HOLDER}\n\n"
         f"❗️ После оплаты нажмите кнопку 'Я оплатил(а)'",
-        reply_markup=get_payment_keyboard()  # кнопка "Я оплатил(а)"
+        reply_markup=get_payment_keyboard()
     )
     
     await callback.answer()
@@ -302,13 +301,13 @@ async def confirm_extend_payment(callback: CallbackQuery):
             await callback.bot.send_message(
                 user_id,
                 f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка продлена на {format_months(months, with_number=False)}.\n\n"
+                f"Подписка продлена на {format_months(months, with_number=True)}.\n\n"
             )
         else:
             await callback.bot.send_message(
                 user_id,
                 f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка продлена на {format_months(months, with_number=False)}.\n\n"
+                f"Подписка продлена на {format_months(months, with_number=True)}.\n\n"
                 f"Спасибо за покупку!"
             )
 
@@ -349,7 +348,7 @@ async def create_user_config(message: Message):
                 f"✅ Ваш конфиг готов!\n\n"
                 f"🔗 VLESS ссылка:\n<code>{safe_link}</code>\n\n"
                 f"📱 Для установки:\n"
-                f"1. Скачайте Amnesia\n"
+                f"1. Скачайте Happ\n"
                 f"2. Нажмите 'Импорт из буфера обмена'\n"
                 f"3. Вставьте ссылку",
                 parse_mode="HTML"

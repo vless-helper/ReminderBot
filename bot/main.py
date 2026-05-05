@@ -12,6 +12,12 @@ from bot.db.base import create_engine_and_session
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+async def init_db(engine):
+    """Создает таблицы при первом запуске"""
+    async with engine.begin() as conn:
+        from bot.db.models import Base
+        await conn.run_sync(Base.metadata.create_all)
+        print("✅ Таблицы проверены/созданы")
 
 class BotWithDB(Bot):
     """Кастомный бот с доступом к сессии БД"""
@@ -33,6 +39,8 @@ async def main():
     # Настройка базы данных
     engine, async_session_maker = create_engine_and_session(config.DATABASE_URL)
     
+    await init_db(engine)
+
     # Создаем бота
     bot = BotWithDB(
         token=config.BOT_TOKEN,

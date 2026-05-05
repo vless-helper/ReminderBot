@@ -157,19 +157,18 @@ async def ask_question(message: Message, state: FSMContext):
     )
     await state.set_state(QuestionState.waiting_for_question)
 
-# bot/handlers/user.py
 @router.callback_query(F.data == "payment_confirmed")
 async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
     """Пользователь подтвердил оплату (подписка или продление)"""
     await callback.message.edit_reply_markup(reply_markup=None)
     
     state_data = await state.get_data()
-    payment_type = state_data.get("payment_type", "subscription")
-    is_extend = state_data.get("is_extend", False)
+    payment_type = state_data.get("payment_type", "subscription")  # теперь будет "new_config"
     extend_months = state_data.get("extend_months", None)
     extend_amount = state_data.get("extend_amount", None)
     is_new_config = state_data.get("is_new_config", False)
     new_config_number = state_data.get("new_config_number", None)
+    new_config_price = state_data.get("new_config_price", None)
     
     async with callback.bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
@@ -178,32 +177,37 @@ async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
             return
         
         # Создаем запись о платеже
-        if is_extend:
+        if payment_type == "extend":
             payment = await crud.create_payment(
                 session, user.id, status="pending", 
                 amount=extend_amount, months=extend_months
             )
-        elif is_new_config:
-            payment = await crud.create_payment(session, user.id, status="pending")
         else:
-            payment = await crud.create_payment(session, user.id, status="pending")
+            # Для подписки и нового конфига
+            amount = new_config_price if is_new_config else config.SUBSCRIPTION_PRICE
+            payment = await crud.create_payment(
+                session, user.id, status="pending", amount=amount, months=None
+            )
         
-        # Сохраняем тип платежа в состояние
+        # Сохраняем данные для админа
         await state.update_data(
             payment_id=payment.id,
-            payment_type="extend" if is_extend else ("new_config" if is_new_config else "subscription"),
+            payment_type=payment_type,
+            is_new_config=is_new_config,
+            new_config_number=new_config_number,
+            new_config_price=new_config_price,
             extend_months=extend_months,
             extend_amount=extend_amount
         )
     
-    payment_type_text = "продления" if is_extend else ("нового конфига" if is_new_config else "подписки")
+    payment_type_text = "продления" if payment_type == "extend" else ("нового конфига" if is_new_config else "подписки")
     
     await callback.message.answer(
         f"✅ Спасибо! Я отправил уведомление администратору об оплате {payment_type_text}.\n"
         "Ожидайте подтверждения. Обычно это занимает до 30 минут."
     )
     
-    # Отправляем уведомление админу с соответствующей клавиатурой
+    # Отправляем уведомление админу
     for admin_id in config.ADMIN_IDS:
         if payment_type == "extend":
             await callback.bot.send_message(
@@ -216,15 +220,26 @@ async def payment_confirmed(callback: CallbackQuery, state: FSMContext):
                 f"Проверьте банк и подтвердите оплату.",
                 reply_markup=get_admin_extend_keyboard(callback.from_user.id, extend_months, extend_amount)
             )
+        elif is_new_config:
+            await callback.bot.send_message(
+                admin_id,
+                f"💰 НОВЫЙ ПЛАТЕЖ (НОВЫЙ КОНФИГ)!\n\n"
+                f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+                f"ID: {callback.from_user.id}\n"
+                f"Конфиг #{new_config_number}\n"
+                f"Сумма: {new_config_price}₽\n\n"
+                f"Проверьте банк и подтвердите оплату.",
+                reply_markup=get_admin_keyboard(callback.from_user.id, is_new_config=True)
+            )
         else:
             await callback.bot.send_message(
                 admin_id,
-                f"💰 НОВЫЙ ПЛАТЕЖ ({payment_type_text.upper()})!\n\n"
+                f"💰 НОВЫЙ ПЛАТЕЖ (ПОДПИСКА)!\n\n"
                 f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
                 f"ID: {callback.from_user.id}\n"
                 f"Сумма: {config.SUBSCRIPTION_PRICE}₽\n\n"
                 f"Проверьте банк и подтвердите оплату.",
-                reply_markup=get_admin_keyboard(callback.from_user.id, is_new_config=is_new_config)
+                reply_markup=get_admin_keyboard(callback.from_user.id, is_new_config=False)
             )
     
     await callback.answer()
@@ -347,8 +362,6 @@ async def my_configs(message: Message):
         
         await message.answer(text, reply_markup=keyboard)
 
-
-# bot/handlers/user.py
 @router.callback_query(F.data == "create_new_config")
 async def create_new_config(callback: CallbackQuery, state: FSMContext):
     """Создать новый конфиг (требует оплаты)"""
@@ -388,7 +401,7 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
                 f"📅 До следующего платежа осталось {days_left} дней.\n"
                 f"💰 Плата за новый конфиг составит {new_config_price}₽ "
                 f"(пропорционально остатку платежного периода).\n"
-                f"При следующем продлении будет взиматься полная стоимость."
+                f"При следующем продлении будет взиматься стоимость за полный период."
             )
         else:
             new_config_price = base_config_price
@@ -398,7 +411,8 @@ async def create_new_config(callback: CallbackQuery, state: FSMContext):
         await state.update_data(
             is_new_config=True,  # <-- ключевой флаг
             new_config_number=next_number,
-            new_config_price=new_config_price
+            new_config_price=new_config_price,
+            payment_type="new_config"
         )
         
         await callback.message.answer(

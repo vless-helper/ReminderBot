@@ -1,36 +1,44 @@
-services:
-  db:
-    image: postgres:16
-    container_name: vpn_bot_postgres
-    environment:
-      POSTGRES_DB: vpn_bot
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      TZ: Europe/Moscow
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    command: >
-      postgres
-      -c log_timezone=Europe/Moscow
-      -c timezone=Europe/Moscow
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+version: '3.8'
 
+services:
   bot:
     build: .
-    container_name: vpn_bot
-    depends_on:
-      db:
-        condition: service_healthy
+    container_name: reminder-bot
+    restart: unless-stopped
+    volumes:
+      # Монтируем том для базы данных
+      - bot_data:/app/data
+      # Монтируем файл .env (опционально)
+      - ./.env:/app/.env:ro
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///data/bot.db
+      - TZ=Europe/Moscow
     env_file:
       - .env
-    environment:
-      TZ: Europe/Moscow
+    networks:
+      - bot-network
+
+  reminder:
+    build: .
+    container_name: reminder-bot-reminder
     restart: unless-stopped
+    volumes:
+      - bot_data:/app/data
+      - ./.env:/app/.env:ro
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///data/bot.db
+      - TZ=Europe/Moscow
+    env_file:
+      - .env
+    command: python -m bot.reminder
+    networks:
+      - bot-network
 
 volumes:
-  postgres_data:
+  bot_data:
+    driver: local
+    name: reminder-bot-data
+
+networks:
+  bot-network:
+    driver: bridge
