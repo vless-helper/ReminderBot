@@ -1,8 +1,8 @@
-version: '3.8'
 
 services:
   bot:
     build: .
+    network_mode: host
     container_name: reminder-bot
     restart: unless-stopped
     volumes:
@@ -15,8 +15,6 @@ services:
       - TZ=Europe/Moscow
     env_file:
       - .env
-    networks:
-      - bot-network
 
   reminder:
     build: .
@@ -31,14 +29,9 @@ services:
     env_file:
       - .env
     command: python -m bot.reminder
-    networks:
-      - bot-network
+    network_mode: host
 
 volumes:
   bot_data:
     driver: local
     name: reminder-bot-data
-
-networks:
-  bot-network:
-    driver: bridge
