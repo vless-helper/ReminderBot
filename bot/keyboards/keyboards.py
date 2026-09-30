@@ -1,139 +1,116 @@
-# bot/keyboards/keyboards.py
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from bot.config import config 
+
+from bot.config import config
 from bot.utils.helpers import format_months, format_price
+from bot.utils.pricing import subscription_price
 
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
-    """Главная клавиатура"""
-    buttons = [
-            [KeyboardButton(text="📦 Купить подписку"), KeyboardButton(text="🔄 Продлить подписку"), KeyboardButton(text="❓ Задать вопрос")],
-            [KeyboardButton(text="ℹ️ Моя подписка"), KeyboardButton(text="📱 Мои конфиги")]
-        ]
-        
     return ReplyKeyboardMarkup(
-        keyboard=buttons, 
-        resize_keyboard=True,  # Автоматически подгонять размер
-        one_time_keyboard=True,  # Скрывать после нажатия (раскомментировать если нужно)
-        input_field_placeholder="Выберите действие",  # Подсказка в поле ввода
-        # selective=True  # Показывать только определенным пользователям
+        keyboard=[
+            [
+                KeyboardButton(text="📦 Купить подписку"),
+                KeyboardButton(text="🔄 Продлить подписку"),
+                KeyboardButton(text="❓ Задать вопрос"),
+            ],
+            [
+                KeyboardButton(text="ℹ️ Моя подписка"),
+                KeyboardButton(text="📱 Мои конфиги"),
+            ],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие",
     )
 
-def get_extend_payment_keyboard(user_id: int, configs_count: int) -> InlineKeyboardMarkup:
-    """Клавиатура для выбора количества месяцев продления"""
+
+def get_extend_keyboard(configs_count: int) -> InlineKeyboardMarkup:
+    """Выбор срока продления. Цена берётся из pricing — ровно та же, что потом начислится."""
     builder = InlineKeyboardBuilder()
-    
-    # Базовая цена за один конфиг
-    base_price = config.BASE_PRICE
-    
-    # Ежемесячная цена с учетом количества конфигов
-    monthly_price = base_price * configs_count
-    
-    # 1 месяц - без скидки
-    price_1_month = monthly_price
-    
-    # 3 месяца - 5% скидка
-    price_3_months = int(monthly_price * 3 * 0.95)
-    
-    # 6 месяцев - 10% скидка
-    price_6_months = int(monthly_price * 6 * 0.9)
-    
-    # 12 месяцев - 15% скидка
-    price_12_months = int(monthly_price * 12 * 0.85)
-    
-    builder.button(text=f"1 месяц ({format_price(price_1_month)})", callback_data="extend_1_month")
-    builder.button(text=f"3 месяца ({format_price(price_3_months)})", callback_data="extend_3_months")
-    builder.button(text=f"6 месяцев ({format_price(price_6_months)})", callback_data="extend_6_months")
-    builder.button(text=f"12 месяцев ({format_price(price_12_months)})", callback_data="extend_12_months")
-    builder.button(text="❌ Отмена", callback_data="payment_cancel")
+    for months, _ in config.period_tiers():
+        price = subscription_price(months, configs_count).total
+        builder.button(
+            text=f"{format_months(months)} — {format_price(price)}",
+            callback_data=f"extend:{months}",
+        )
+    builder.button(text="❌ Отмена", callback_data="close")
     builder.adjust(1)
     return builder.as_markup()
 
-def get_admin_extend_keyboard(user_id: int, months: int, amount: int) -> InlineKeyboardMarkup:
-    """Клавиатура для админа с указанием месяцев"""
-    builder = InlineKeyboardBuilder()
-    builder.button(
-        text=f"✅ Подтвердить оплату ({months} мес, {amount}₽)", 
-        callback_data=f"confirm_extend_{user_id}_{months}_{amount}"
-    )
-    builder.button(
-        text="❌ Отклонить оплату", 
-        callback_data=f"reject_payment_{user_id}"
-    )
-    return builder.as_markup()
 
-def get_payment_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для оплаты"""
+def get_payment_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    """Оплата. В callback_data сразу id платежа — админ подтвердит именно его."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Я оплатил(а)", callback_data="payment_confirmed")
-    builder.button(text="❌ Отмена", callback_data="payment_cancel")
+    builder.button(text="✅ Я оплатил(а)", callback_data=f"pay:{payment_id}")
+    builder.button(text="❌ Отмена", callback_data="close")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def get_admin_payment_keyboard(payment_id: int, amount: int, title: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"✅ Подтвердить {title} ({format_price(amount)})", callback_data=f"ok:{payment_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"no:{payment_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
 
 def get_question_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Отмена", callback_data="question_cancel")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_admin_keyboard(user_id: int, is_new_config: bool = False) -> InlineKeyboardMarkup:
-    """Клавиатура для админа"""
-    builder = InlineKeyboardBuilder()
-    if is_new_config:
-        builder.button(text="✅ Подтвердить создание конфига", callback_data=f"confirm_payment_{user_id}_new")
-    else:
-        builder.button(text="✅ Подтвердить оплату", callback_data=f"confirm_payment_{user_id}")
-    builder.button(text="❌ Отклонить оплату", callback_data=f"reject_payment_{user_id}")
-    return builder.as_markup()
-
-
-def get_confirm_question_keyboard(question_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура для подтверждения ответа на вопрос"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📨 Отправить ответ", callback_data=f"send_answer_{question_id}")
-    return builder.as_markup()
-
-# Клава для конфигов 
-
-def get_config_actions_keyboard(config_id: int, config_number: int, is_protected: bool = False) -> InlineKeyboardMarkup:
-    """Клавиатура действий с конфигом"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔗 Получить ссылку", callback_data=f"show_config_{config_id}")
-    
-    # Кнопка удаления только если конфиг не защищен
-    if not is_protected:
-        builder.button(text="🗑 Удалить конфиг", callback_data=f"delete_config_{config_id}")
-    
-    builder.button(text="◀️ Назад к списку", callback_data="back_to_configs")
+    builder.button(text="❌ Отмена", callback_data="close")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def get_configs_keyboard(user_id: int, configs: list) -> InlineKeyboardMarkup:
-    """Клавиатура для выбора конфига"""
+def get_configs_keyboard(configs: list) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    
-    if not configs:
-        builder.button(text="➕ Создать конфиг", callback_data="create_new_config")
-    else:
-        for cfg in configs:
-            # Показываем защищенный конфиг с особым значком
-            icon = "🔒" if cfg.is_protected else "📱"
-            builder.button(
-                text=f"{icon} Конфиг #{cfg.config_number}", 
-                callback_data=f"select_config_{cfg.id}"
-            )
-        builder.button(text="➕ Создать новый конфиг", callback_data="create_new_config")
-    
-    builder.button(text="❌ Закрыть", callback_data="close_configs")
+    for cfg in configs:
+        icon = "🔒" if cfg.is_protected else "📱"
+        builder.button(
+            text=f"{icon} Конфиг #{cfg.config_number}",
+            callback_data=f"cfg:{cfg.id}",
+        )
+    builder.button(text="➕ Докупить конфиг", callback_data="cfgnew")
+    builder.button(text="❌ Закрыть", callback_data="close")
     builder.adjust(1)
     return builder.as_markup()
 
-def get_config_payment_keyboard(config_number: int, price: int) -> InlineKeyboardMarkup:
-    """Клавиатура для оплаты нового конфига"""
+
+def get_config_actions_keyboard(cfg) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text=f"💰 Оплатить конфиг #{config_number} ({price}₽)", callback_data=f"pay_new_config_{config_number}")
-    builder.button(text="❌ Отмена", callback_data="cancel_new_config")
+    builder.button(text="🔗 Получить ссылку", callback_data=f"link:{cfg.id}")
+
+    if not cfg.is_protected:
+        builder.button(text="🗑 Удалить конфиг", callback_data=f"del:{cfg.id}")
+
+    builder.button(text="◀️ К списку", callback_data="cfglist")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def get_config_pay_keyboard(payment_id: int, price: int) -> InlineKeyboardMarkup:
+    return get_payment_keyboard(payment_id)
+
+
+def render_price_breakdown(counts_text: str, price, extra: str = "") -> str:
+    """Единый вид цены для всех экранов оплаты."""
+    lines = [f"💰 К оплате: <b>{format_price(price.total)}</b>", ""]
+    lines += [f"• {line}" for line in price.lines()]
+    if extra:
+        lines += ["", extra]
+    if counts_text:
+        lines.insert(2, counts_text)
+    return "\n".join(lines)
+
+
+def get_retry_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    """Повторная обработка платежа, который зачислили, но не смогли применить."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔁 Повторить", callback_data=f"retry:{payment_id}"
+                )
+            ]
+        ]
+    )

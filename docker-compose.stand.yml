@@ -1,0 +1,75 @@
+# Стенд: бот + PostgreSQL + настоящий cli-vless-manager.
+#
+# Запуск (VLESS_MANAGER_SRC — путь к клону cli-vless-manager):
+#   VLESS_MANAGER_SRC=/path/to/cli-vless-manager \
+#   BOT_ENV_FILE=.env.stand POSTGRES_PASSWORD=standpass \
+#   docker compose -f docker-compose.yml -f docker-compose.stand.yml up -d --build
+#
+# В стенде токен бота заведомо невалидный: бот поднимается, создаёт схему,
+# пишет в БД и упирается только в авторизацию Telegram. Так стенд не
+# подключается к боевому боту.
+
+services:
+  vless-manager:
+    build:
+      context: ${VLESS_MANAGER_SRC}
+      dockerfile: Dockerfile
+    container_name: reminder-stand-vless-manager
+    restart: unless-stopped
+    env_file:
+      - stand/manager.env
+    environment:
+      API_PORT: "8080"
+      SERVER_JSON_NAME: /app/config.json
+      CLIENTS_JSON_NAME: /app/clients.json
+    volumes:
+      - ./stand/config.json:/app/config.json
+      - ./stand/clients.json:/app/clients.json
+    depends_on:
+      reloader:
+        condition: service_started
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # Контейнер с sing-box: именно его релоадер перезапускает после изменения
+  # списка клиентов. Без него админка отвечает 500 на любую мутацию.
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:latest
+    container_name: reminder-stand-sing-box
+    restart: unless-stopped
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes:
+      - ./stand/config.json:/etc/sing-box/config.json:ro
+    cap_add:
+      - NET_ADMIN
+
+  reloader:
+    build:
+      context: ${RELOADER_SRC}
+      dockerfile: Dockerfile
+    container_name: reminder-stand-reloader
+    restart: unless-stopped
+    environment:
+      LISTEN_ADDR: ":8080"
+      SING_BOX_CONTAINER: "reminder-stand-sing-box"
+      RESTART_TIMEOUT_SECONDS: "10"
+      RELOAD_TOKEN: "stand-token"
+    # Релоадер управляет контейнерами через docker.sock — это фактически
+    # root-доступ к хосту. В бою сокет монтируется только туда, где это нужно.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8080"
+
+  bot:
+    depends_on:
+      db:
+        condition: service_healthy
+      vless-manager:
+        condition: service_started

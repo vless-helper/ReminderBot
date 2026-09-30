@@ -1,0 +1,48 @@
+{
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "tag": "vless-reality-in",
+      "tls": {
+        "enabled": true,
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "<reality private key>",
+          "short_id": [
+            "99dae88d",
+            "8f783910"
+          ]
+        },
+        "server_name": "stand.example.com"
+      },
+      "type": "vless",
+      "users": []
+    }
+  ],
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct",
+    "rules": [
+      {
+        "inbound": [
+          "vless-reality-in"
+        ],
+        "outbound": "direct"
+      }
+    ]
+  }
+}

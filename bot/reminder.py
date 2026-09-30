@@ -1,158 +1,182 @@
+"""Напоминания об оплате.
+
+Раньше был один флаг last_reminder_sent на все виды напоминаний, поэтому
+3-дневное гасило 1-дневное, а 1-дневного не существовало вовсе, если
+REMINDER_DAYS_BEFORE содержал только 3. Теперь отметки лежат в reminder_log
+по ключу (подписка, дней_до), поэтому окна независимы и добавляются через
+REMINDER_DAYS_BEFORE без правок кода.
+
+Также раньше был отдельный контейнер `python -m bot.reminder`, поднимавший
+второе подключение к Telegram. Теперь цикл живёт в основном процессе.
+"""
+
 import asyncio
 import logging
-from datetime import datetime
-from aiogram import Bot
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-from bot.api.client import admin_api
-from bot.config import config
+from aiogram import Bot
+
+from bot.api.client import AdminAPIError, admin_api
+from bot.config import config, utcnow
 from bot.db import crud
+from bot.utils.helpers import format_price
+from bot.utils.pricing import monthly_price
 
 logger = logging.getLogger(__name__)
 
 
-def should_send_reminder() -> bool:
-    """Проверяет, нужно ли отправлять напоминания сейчас"""
-    current_hour = datetime.now().hour
+def in_reminder_window() -> bool:
+    """Отправляем напоминания только в заданные часы по локальному времени."""
+    hour = config.local(utcnow()).hour
+    return config.REMINDER_START_HOUR <= hour <= config.REMINDER_END_HOUR
 
-    if hasattr(config, 'REMINDER_START_HOUR') and hasattr(config, 'REMINDER_END_HOUR'):
-        return config.REMINDER_START_HOUR <= current_hour <= config.REMINDER_END_HOUR
 
-    # Если ничего не задано, отправляем всегда
+def _plural_days(n: int) -> str:
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    last = n % 10
+    if last == 1:
+        return "день"
+    if 2 <= last <= 4:
+        return "дня"
+    return "дней"
+
+
+async def _send_upcoming(bot: Bot, sub, days_before: int) -> bool:
+    """Напоминание «скоро заморозка». Текст зависит от числа дней."""
+    days_left = max(0, (sub.next_payment - utcnow()).days)
+
+    if days_before == 1:
+        header = "⚠️ <b>Завтра заморозка подписки</b>"
+        body = "После заморозки доступ к конфигам будет закрыт."
+    elif days_before <= 3:
+        header = "⏳ <b>Скоро заморозка подписки</b>"
+        body = "Продлите заранее — и конфиги продолжат работать."
+    else:
+        header = f"⏳ <b>До заморозки подписки {days_left} дн.</b>"
+        body = "Продлите заранее, чтобы не потерять доступ к конфигам."
+
+    try:
+        await bot.send_message(
+            sub.user.telegram_id,
+            f"{header}\n\n"
+            f"Дата заморозки: {config.format_dt(sub.next_payment)}\n\n"
+            f"{body}\n"
+            f"Кнопка «Продлить подписку».",
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Не удалось отправить напоминание (-%s дн.) пользователю %s: %s",
+            days_before,
+            sub.user.telegram_id,
+            e,
+        )
+        return False
+
+
+async def _expire(bot: Bot, session, sub) -> bool:
+    """Сообщить об истечении и отозвать доступ к конфигам в админке."""
+    try:
+        configs_count = await crud.get_active_configs_count(session, sub.user_id)
+        price = monthly_price(configs_count)
+
+        await bot.send_message(
+            sub.user.telegram_id,
+            f"🔒 <b>Подписка заморожена</b>\n\n"
+            f"Срок истёк {config.format_dt(sub.next_payment, with_time=True)}.\n"
+            f"Доступ к конфигам отключён.\n\n"
+            f"Чтобы вернуть доступ, оплатите {format_price(price)} — "
+            f"кнопка «Продлить подписку».",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Не удалось отправить уведомление об истечении %s: %s", sub.user.telegram_id, e
+        )
+
+    configs = await crud.get_user_configs(session, sub.user_id)
+    blocked = 0
+    for cfg in configs:
+        try:
+            await admin_api.archive_user(cfg.config_name)
+            blocked += 1
+        except AdminAPIError as e:
+            # Пользователь заблокирован не полностью — сообщаем админу
+            logger.error("Не удалось заблокировать %s: %s", cfg.config_name, e)
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"❌ Не удалось заблокировать конфиг {cfg.config_name} "
+                        f"(пользователь {sub.user.telegram_id}): {e}",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Не удалось отправить алерт админу %s", admin_id)
+
+    await crud.expire_subscription(session, sub.id)
+    logger.info(
+        "Подписка %s истекла: заблокировано конфигов %d/%d",
+        sub.user.telegram_id,
+        blocked,
+        len(configs),
+    )
     return True
 
-async def send_reminder_3days(bot: Bot, subscription, days_left: int):
-    """Отправить напоминание за 3 дня"""
+
+async def check_and_send_reminders(bot: Bot, session_maker=None) -> int:
+    """Один проход проверки. Возвращает количество отправленных уведомлений.
+
+    Истечение обрабатывается вне окна напоминаний: иначе просрочку можно было бы
+    пропустить, если цикл упал ночью.
+    """
+    if session_maker is None:
+        from bot.db.base import create_engine_and_session
+
+        engine, session_maker = create_engine_and_session(config.DATABASE_URL)
+        owns_engine = True
+    else:
+        engine = None
+        owns_engine = False
+
+    sent = 0
+
     try:
-        await bot.send_message(
-            subscription.user.telegram_id,
-            f"⚠️ Напоминание!\n\n"
-            f"Ваша подписка истекает через {days_left + 1} дня(ей).\n"
-            f"Дата блокировки: {subscription.next_payment.strftime('%d.%m.%Y')}\n\n"
-            f"Пожалуйста, продлите подписку до этого времени, чтобы не потерять доступ.\n\n"
-            f"Для продления нажмите 'Продлить подписку'"
-        )
-        logger.info(f"Напоминание за {days_left} дня отправлено пользователю {subscription.user.telegram_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки напоминания: {e}")
-        return False
+        async with session_maker() as session:
+            if in_reminder_window():
+                for days_before in sorted(config.REMINDER_DAYS_BEFORE, reverse=True):
+                    for sub in await crud.get_due_reminder_subscriptions(session, days_before):
+                        if await _send_upcoming(bot, sub, days_before):
+                            await crud.mark_reminder_sent(session, sub.id, days_before)
+                            sent += 1
+
+            for sub in await crud.get_expired_subscriptions(session):
+                if await _expire(bot, session, sub):
+                    sent += 1
+    finally:
+        if owns_engine:
+            await engine.dispose()
+
+    if sent:
+        logger.info("Отправлено уведомлений: %d", sent)
+    return sent
 
 
-async def send_reminder_1day(bot: Bot, subscription):
-    """Отправить напоминание за 1 день"""
-    try:
-        expire_time = subscription.next_payment
-        expire_time_str = expire_time.strftime('%d.%m.%Y в %H:%M')
-        
-        await bot.send_message(
-            subscription.user.telegram_id,
-            f"⚠️ Срочное напоминание!\n\n"
-            f"ЗАВТРА ({expire_time_str}) ваша подписка истекает!\n\n"
-            f"Пожалуйста, продлите подписку сегодня, чтобы не потерять доступ.\n\n"
-            f"Для продления нажмите 'Продлить подписку'"
-        )
-        logger.info(f"Напоминание за 1 день отправлено пользователю {subscription.user.telegram_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки напоминания за 1 день: {e}")
-        return False
+async def reminder_loop(bot: Bot, session_maker):
+    """Фоновый цикл. Запускается вместе с ботом в том же процессе."""
+    logger.info(
+        "Цикл напоминаний запущен: интервал %ds, окно %02d–%02d %s, окна напоминаний: %s",
+        config.REMINDER_CHECK_INTERVAL,
+        config.REMINDER_START_HOUR,
+        config.REMINDER_END_HOUR,
+        config.REMINDER_TIMEZONE,
+        config.REMINDER_DAYS_BEFORE,
+    )
 
-
-async def send_expired_today_reminder(bot: Bot, subscription, session):
-    """Отправить уведомление, что подписка истекла сегодня"""
-    try:
-        expire_time = subscription.next_payment
-        expire_time_str = expire_time.strftime('%d.%m.%Y в %H:%M')
-
-        await bot.send_message(
-            subscription.user.telegram_id,
-            f"⏰ Внимание!\n\n"
-            f"Срок вашей подписки истек {expire_time_str}!\n"
-            f"Оплатите подписку для продолжения использования сервиса.\n\n"
-            f"Для оплаты нажмите 'Купить подписку'"
-        )
-        logger.info(f"Уведомление об истечении отправлено пользователю {subscription.user.telegram_id}")
-
-        # Исправлено: меняем статус через session, а не через subscription.session
-        subscription.status = "expired"
-        await session.commit()
-
-        configs = await crud.get_user_configs(session, subscription.user_id)
-        archived_configs = 0
-
-        for cfg in configs:
-            success = await admin_api.archive_user(cfg.config_name)
-            if success:
-                archived_configs += 1
-                logger.info(f"Заархивированно {archived_configs} конфигов пользователя {subscription.user.telegram_id}")
-
-        await crud.mark_reminder_sent(session, subscription.id)
-
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки уведомления об истечении: {e}")
-        return False
-
-
-async def check_and_send_reminders(bot: Bot):
-    """Проверка и отправка напоминаний"""
-
-    if not should_send_reminder():
-        logger.debug("Сейчас не время для отправки напоминаний")
-        return
-    
-    engine = create_async_engine(config.DATABASE_URL, echo=False)
-    async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
-    
-    async with async_session_maker() as session:
-        # 1. Напоминания за 3 дня до истечения
-        expiring_soon = await crud.get_expiring_subscriptions(session, 3)
-        
-        for subscription in expiring_soon:
-            days_left = (subscription.next_payment - datetime.now()).days
-            
-            # subscription.user уже загружен через selectinload
-            success = await send_reminder_3days(bot, subscription, days_left)
-            
-            if success:
-                await crud.mark_reminder_sent(session, subscription.id)
-        
-        # 2. Напоминания за 1 день до истечения (ДОБАВЛЯЕМ!)
-        expiring_tomorrow = await crud.get_expiring_tomorrow_subscriptions(session)
-        
-        for subscription in expiring_tomorrow:
-            success = await send_reminder_1day(bot, subscription)
-            
-            if success:
-                await crud.mark_reminder_sent(session, subscription.id)
-        
-        # 3. Уведомления, что подписка истекла сегодня + архивирование конфигов
-        expired_today = await crud.get_expired_today_subscriptions(session)
-        
-        for subscription in expired_today:
-            # subscription.user уже загружен через selectinload
-            await send_expired_today_reminder(bot, subscription, session)
-    
-    await engine.dispose()
-
-
-async def reminder_loop():
-    """Запуск цикла проверки напоминаний"""
-    bot = Bot(token=config.BOT_TOKEN)
-    
-    logger.info("Цикл напоминаний запущен")
-    
     while True:
         try:
-            await check_and_send_reminders(bot)
-        except Exception as e:
-            logger.error(f"Ошибка в цикле напоминаний: {e}")
-        
-        # Для теста 10 секунд, для продакшена 3600
-        await asyncio.sleep(10)  # В продакшене поменять на 3600
+            await check_and_send_reminders(bot, session_maker)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в цикле напоминаний: %s", e)
 
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(reminder_loop())
+        await asyncio.sleep(config.REMINDER_CHECK_INTERVAL)

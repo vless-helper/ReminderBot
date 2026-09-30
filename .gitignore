@@ -26,7 +26,11 @@ env/
 
 
 .env
-.env.* 
+.env.*
+!.env.example
+*.db
+data/
+
 
 
 # Docker

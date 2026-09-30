@@ -1,535 +1,622 @@
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+"""Админские хендлеры.
+
+Главное изменение: подтверждение оплаты берёт все данные из записи Payment в БД
+по payment_id, который приходит в callback_data. Раньше здесь читался FSM
+админа, из-за чего при работе с чужим аккаунтом (не совпадающим с аккаунтом
+плательщика) тип платежа и срок всегда терялись.
+"""
+
+import logging
+from datetime import timedelta
+
+from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-import html
-from datetime import datetime, timedelta
+from aiogram.types import CallbackQuery, Message
 
-from bot.utils.helpers import decline_months, format_months, format_price, format_date
-from bot.utils.admin_utils import require_admin, get_args
-from bot.config import config
+from bot.api.client import AdminAPIError, admin_api
+from bot.config import config, utcnow
 from bot.db import crud
-from bot.keyboards.keyboards import get_admin_extend_keyboard, get_payment_keyboard
-from bot.api.client import admin_api
+from bot.keyboards.keyboards import get_admin_payment_keyboard, get_retry_keyboard
+from bot.utils.admin_utils import get_args, require_admin
+from bot.utils.helpers import format_months, format_price
 
+logger = logging.getLogger(__name__)
 router = Router()
+
+
+def _is_admin(telegram_id: int) -> bool:
+    return telegram_id in config.ADMIN_IDS
+
+
+def _payment_title(payment) -> str:
+    if payment.type == "extend":
+        return f"продление на {format_months(payment.months or 1)}"
+    if payment.type == "new_config":
+        return f"конфиг #{payment.config_number}"
+    return "подписка"
+
+
+async def _apply_payment_to_user(session, payment, bot) -> str:
+    """Применить оплаченное действие. Возвращает текст для пользователя.
+
+    Порядок важен: сначала эффект в БД (и отметка payment.effect_applied),
+    затем обращения к админке. Поэтому повторная обработка не продлит
+    подписку дважды, а лишь пересоздаст/разблокирует конфиг заново.
+    """
+    user_id = payment.user_id
+
+    # --- Эффект в БД ---
+    already_applied = payment.effect_applied
+    vless_link = None
+    name = None
+    number = 1
+
+    if not already_applied:
+        if payment.type == "extend":
+            months = payment.months or 1
+            await crud.extend_subscription_months(session, user_id, months)
+            days = config.days_for_months(months)
+            await crud.extend_all_configs_paid_until(session, user_id, days)
+        else:
+            # Первая подписка
+            sub = await crud.reactivate_subscription(session, user_id, config.SUBSCRIPTION_DAYS)
+            existing = await crud.get_user_configs(session, user_id)
+            if not existing:
+                number = payment.config_number or 1
+                name = f"user_{await _tg_id(session, user_id)}_{number}"
+
+        await crud.mark_effect_applied(session, payment.id)
+
+    # --- Внешние вызовы ---
+    if payment.type == "new_config":
+        number = payment.config_number or 1
+        name = f"user_{await _tg_id(session, user_id)}_{number}"
+        cfg = await crud.get_config_by_name(session, name)
+
+        if cfg and cfg.vless_link:
+            vless_link = cfg.vless_link
+        else:
+            # get_or_create идемпотентен: если POST уже прошёл, ссылка просто
+            # заберётся заново, второй пользователь не создастся
+            vless_link = await admin_api.get_or_create_user_config(name)
+            if cfg:
+                cfg.vless_link = vless_link
+                await session.commit()
+            else:
+                days_left = await crud.days_left(session, user_id)
+                paid_until = utcnow() + timedelta(
+                    days=days_left if days_left > 0 else config.SUBSCRIPTION_DAYS
+                )
+                await crud.create_client_config(
+                    session, user_id, number, name, vless_link,
+                    is_protected=False, paid_until=paid_until,
+                )
+
+        return (
+            f"✅ <b>Конфиг #{number} создан</b>\n\n"
+            f"🔗 <code>{vless_link}</code>\n\n"
+            f"Оплачен до: {config.format_dt(cfg.paid_until) if cfg else '—'}\n\n"
+            f"Ссылка продублирована в разделе «Мои конфиги»."
+        )
+
+    if payment.type == "extend":
+        months = payment.months or 1
+    else:
+        months = None
+
+    # Разблокируем конфиги: операция идемпотентна, поэтому её безопасно повторять
+    configs = await crud.get_user_configs(session, user_id)
+    failed_to_unlock: list[str] = []
+    for cfg in configs:
+        try:
+            await admin_api.unarchive_user(cfg.config_name)
+        except AdminAPIError as e:
+            failed_to_unlock.append(cfg.config_name)
+            logger.error("Не удалось разблокировать %s: %s", cfg.config_name, e)
+
+    if failed_to_unlock:
+        # Подписка продлена, но доступ не выдан. Поднимаем ошибку, чтобы платёж
+        # ушёл в failed с кнопкой «Повторить»: подписка повторно не продлится
+        # (effect_applied), а разблокировка повторится.
+        raise AdminAPIError(
+            "Не удалось вернуть доступ к конфигам: " + ", ".join(failed_to_unlock)
+        )
+
+    sub = await crud.get_user_subscription(session, user_id)
+
+    if payment.type == "extend":
+        return (
+            f"✅ <b>Оплата подтверждена</b>\n\n"
+            f"Подписка продлена на {format_months(months)}.\n"
+            f"Доступ к VPN восстановлен."
+        )
+
+    if not configs:
+        number = payment.config_number or 1
+        name = f"user_{await _tg_id(session, user_id)}_{number}"
+        vless_link = await admin_api.get_or_create_user_config(name)
+        await crud.create_client_config(
+            session, user_id, number, name, vless_link,
+            is_protected=True, paid_until=sub.next_payment,
+        )
+        return (
+            f"✅ <b>Подписка активирована</b>\n\n"
+            f"Срок: до {config.format_dt(sub.next_payment)}\n\n"
+            f"🔗 <code>{vless_link}</code>\n\n"
+            f"Ссылка также в разделе «Мои конфиги»."
+        )
+
+    return (
+        f"✅ <b>Оплата подтверждена</b>\n\n"
+        f"Подписка активна до {config.format_dt(sub.next_payment)}.\n"
+        f"Доступ к конфигам восстановлен."
+    )
+
+
+async def _tg_id(session, user_pk: int) -> int:
+    from sqlalchemy import select
+
+    from bot.db.models import User
+
+    return (
+        await session.execute(select(User.telegram_id).where(User.id == user_pk))
+    ).scalar_one()
+
+
+# --- Подтверждение / отклонение ---
+
+
+async def _process_payment(callback: CallbackQuery, payment_id: int) -> None:
+    """Общая часть подтверждения и повторной обработки."""
+    async with callback.bot.get_db_session() as session:
+        claimed = await crud.claim_payment(session, payment_id, callback.from_user.id)
+        if claimed is None:
+            await callback.answer("По этому платежу уже ответили", show_alert=True)
+            return
+
+        payment = await crud.get_payment(session, payment_id)
+        tg_id = await _tg_id(session, payment.user_id)
+
+        try:
+            text = await _apply_payment_to_user(session, payment, callback.bot)
+        except AdminAPIError as e:
+            # Деньги зачислены, доступ не выдали. Не теряем платёж: помечаем
+            # failed и даём админу кнопку «Повторить» — эффекты в БД при этом
+            # не применяются дважды (payment.effect_applied).
+            logger.error("Ошибка применения платежа %s: %s", payment_id, e)
+            await crud.fail_payment(session, payment_id, str(e))
+
+            await _edit_admin_message(
+                callback,
+                f"⚠️ Платёж #{payment_id} зачислен, но доступ не выдан.\n{e}",
+                reply_markup=get_retry_keyboard(payment_id),
+            )
+            await callback.answer("⚠️ Ошибка — есть кнопка «Повторить»", show_alert=True)
+            return
+
+        await crud.complete_payment(session, payment_id)
+
+    await callback.answer("✅ Подтверждено", show_alert=True)
+    await _edit_admin_message(callback, f"✅ Платёж #{payment_id} подтверждён.")
+
+    try:
+        await callback.bot.send_message(tg_id, text, parse_mode="HTML")
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось отправить подтверждение пользователю %s: %s", tg_id, e)
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await callback.bot.send_message(
+                    admin_id,
+                    f"⚠️ Платёж #{payment_id} обработан, но уведомление пользователю "
+                    f"{tg_id} не дошло: {e}",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отправить алерт админу %s", admin_id)
+
+
+@router.callback_query(F.data.startswith("ok:"))
+async def confirm_payment(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет прав", show_alert=True)
+        return
+    await _process_payment(callback, int(callback.data.split(":")[1]))
+
+
+@router.callback_query(F.data.startswith("retry:"))
+async def retry_payment(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет прав", show_alert=True)
+        return
+    await _process_payment(callback, int(callback.data.split(":")[1]))
+
+
+@router.callback_query(F.data.startswith("no:"))
+async def reject_payment(callback: CallbackQuery):
+    payment_id = int(callback.data.split(":")[1])
+
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    async with callback.bot.get_db_session() as session:
+        payment = await crud.get_payment(session, payment_id)
+        if not payment:
+            await callback.answer("Платёж не найден", show_alert=True)
+            return
+
+        if payment.status in {"completed", "rejected"}:
+            await callback.answer("По этому платежу уже ответили", show_alert=True)
+            return
+
+        # Отклонять можно только пока эффект не применён
+        if payment.effect_applied:
+            await callback.answer(
+                "Эффект уже применён, отклонить нельзя — разберитесь вручную",
+                show_alert=True,
+            )
+            return
+
+        payment.status = "rejected"
+        payment.resolved_at = utcnow()
+        payment.resolved_by = callback.from_user.id
+        await session.commit()
+
+        tg = await _tg_id(session, payment.user_id)
+
+    await callback.answer("❌ Отклонено", show_alert=True)
+    await _edit_admin_message(callback, f"❌ Платёж #{payment_id} отклонён.")
+
+    await callback.bot.send_message(
+        tg,
+        "❌ <b>Оплата не подтверждена</b>\n\n"
+        "Возможно, реквизиты отличаются от указанных. "
+        "Напишите администратору — разберёмся.",
+        parse_mode="HTML",
+    )
+
+
+async def _edit_admin_message(callback: CallbackQuery, text: str, reply_markup=None):
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except Exception:  # noqa: BLE001
+        logger.debug("Не удалось отредактировать сообщение админа", exc_info=True)
+
+
+# --- Команды ---
+
 
 @router.message(Command("answer"))
 async def answer_question(message: Message):
-    """Ответ на вопрос пользователя"""
     if not await require_admin(message):
         return
 
-    args, error = get_args(message, min_args=2, usage="❌ Использование: /answer [user_id] [текст ответа]\nПример: /answer 123456789 Спасибо за вопрос!")
+    args, error = get_args(
+        message,
+        min_args=2,
+        usage=(
+            "❌ Использование: /answer [telegram_id] [текст]\n"
+            "Пример: /answer 123456789 Спасибо за вопрос!"
+        ),
+    )
     if error:
         await message.answer(error)
         return
 
+    tg_id = int(args[0])
+    text = " ".join(args[1:])
+
     try:
-        user_id = int(args[0])
-        answer_text = "".join(args[1:])
-
-        await message.bot.send_message(
-            user_id,
-            f"📨 Ответ от администратора:\n\n{answer_text}"
-        )
-
-        await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
-
-    except ValueError:
-        await message.answer("❌ Неверный формат ID пользователя")
-
-@router.callback_query(F.data.startswith("confirm_payment_"))
-async def confirm_payment(callback: CallbackQuery, state: FSMContext):
-    """Подтверждение оплаты (подписки или нового конфига)"""
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("⛔ У вас нет прав", show_alert=True)
+        await message.bot.send_message(tg_id, f"📨 <b>Ответ администратора</b>\n\n{text}", parse_mode="HTML")
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"❌ Не удалось отправить: {e}")
         return
 
-    parts = callback.data.split("_")
-    user_id = int(parts[2])
+    await message.answer(f"✅ Отправлено пользователю {tg_id}")
 
-    # Получаем данные из состояния
-    state_data = await state.get_data()
-    is_new_config = state_data.get("is_new_config", False)
-    new_config_number = state_data.get("new_config_number", None)
-    payment_type = state_data.get("payment_type", "subscription")
-    extend_months = state_data.get("extend_months", None)
-    extend_amount = state_data.get("extend_amount", None)
 
-    async with callback.bot.get_db_session() as session:
-        user = await crud.get_user_by_telegram_id(session, user_id)
-        if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
+@router.message(Command("pending"))
+async def list_pending(message: Message):
+    """Показать все неподтверждённые платежи — чтобы ничего не потерялось."""
+    if not await require_admin(message):
+        return
 
-        # Находим последний платеж
-        payment = await crud.get_last_pending_payment(session, user.id)
-        if payment:
-            await crud.update_payment_status(session, payment.id, "completed")
+    async with message.bot.get_db_session() as session:
+        from sqlalchemy import select
 
-        if payment_type == "extend" and extend_months:
-            # ПРОДЛЕНИЕ ПОДПИСКИ
-            await crud.extend_subscription_months(session, user.id, extend_months)
-            await crud.extend_all_configs_paid_until(session, user.id, extend_months)
+        from bot.db.models import Payment, User
 
-            # Разархивируем конфиги
-            configs = await crud.get_user_configs(session, user.id)
-            for cfg in configs:
-                await admin_api.unarchive_user(cfg.config_name)
+        stmt = (
+            select(Payment, User)
+            .join(User, User.id == Payment.user_id)
+            .where(Payment.status == "pending")
+            .order_by(Payment.created_at)
+        )
+        rows = (await session.execute(stmt)).all()
 
-            await callback.bot.send_message(
-                user_id,
-                f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка продлена на {format_months(extend_months)}.\n\n"
-                f"📱 Ваши конфиги снова активны.\n\n"
-                f"Спасибо за покупку!"
+    if not rows:
+        await message.answer("✅ Неподтверждённых платежей нет.")
+        return
+
+    lines = ["⏳ <b>Неподтверждённые платежи</b>\n"]
+    for payment, user in rows:
+        kb = get_admin_payment_keyboard(payment.id, payment.amount, _payment_title(payment))
+        lines.append(
+            f"• #{payment.id} — {user.username and f'@{user.username}' or user.telegram_id} "
+            f"({_payment_title(payment)}): {format_price(payment.amount)}"
+        )
+        await message.answer(
+            f"Платёж #{payment.id} — {_payment_title(payment)}\n"
+            f"Пользователь: {user.username and f'@{user.username}' or user.telegram_id}\n"
+            f"ID: <code>{user.telegram_id}</code>\n"
+            f"Сумма: {format_price(payment.amount)}\n"
+            f"Создан: {config.format_dt(payment.created_at, with_time=True)}",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("stats"))
+async def stats(message: Message):
+    if not await require_admin(message):
+        return
+
+    from sqlalchemy import func, select
+
+    from bot.db.models import ClientConfig, Payment, Subscription, User
+
+    async with message.bot.get_db_session() as session:
+        total_users = (await session.execute(select(func.count(User.id)))).scalar_one()
+        active = (
+            await session.execute(
+                select(func.count(Subscription.id)).where(
+                    Subscription.status == "active", Subscription.next_payment > utcnow()
+                )
             )
-            await callback.answer(f"✅ Продление на {extend_months} мес. подтверждено!", show_alert=True)
+        ).scalar_one()
+        expired = (
+            await session.execute(
+                select(func.count(Subscription.id)).where(Subscription.next_payment <= utcnow())
+            )
+        ).scalar_one()
+        configs = (
+            await session.execute(select(func.count(ClientConfig.id)).where(ClientConfig.is_active.is_(True)))
+        ).scalar_one()
+        pending = (
+            await session.execute(select(func.count(Payment.id)).where(Payment.status == "pending"))
+        ).scalar_one()
+        revenue = (
+            await session.execute(
+                select(func.coalesce(func.sum(Payment.amount), 0)).where(Payment.status == "completed")
+            )
+        ).scalar_one()
 
-        elif payment_type == "new_config" and new_config_number:
-
-            # СОЗДАНИЕ НОВОГО КОНФИГА
-            config_name = f"user_{user_id}_{new_config_number}"
-
-            # Создаем конфиг в админке
-            vless_link = await admin_api.create_user_and_get_config(config_name)
-
-            if vless_link:
-                # Вычисляем дату, до которой оплачен конфиг
-                days_left = await crud.get_remaining_days_until_next_payment(session, user.id)
-
-                # Устанавливаем paid_until для конфига
-                paid_until = datetime.now() + timedelta(days=days_left) if days_left > 0 else datetime.now() + timedelta(days=30)
-
-                # Сохраняем конфиг в БД
-                new_config = await crud.create_client_config(
-                    session, user.id, new_config_number, config_name, vless_link,
-                    is_protected=False, paid_until=paid_until
-                )
-
-                await callback.bot.send_message(
-                    user_id,
-                    f"✅ Новый конфиг #{new_config_number} создан!\n\n"
-                    f"🔗 VLESS ссылка:\n{vless_link}\n\n"
-                    f"📅 Оплачен до: {format_date(paid_until)}\n\n"
-                    f"Сохраните ссылку в надежном месте."
-                )
-
-                await callback.answer(f"✅ Конфиг #{new_config_number} создан!", show_alert=True)
-            else:
-                await callback.answer("❌ Не удалось создать конфиг", show_alert=True)
-
-            # Очищаем состояние
-            await state.clear()
-
-        else:
-            # ПРОДЛЕНИЕ ПОДПИСКИ (не создаем новый конфиг)
-            await crud.extend_subscription(session, user.id, config.SUBSCRIPTION_DAYS)
-
-            # Проверяем, есть ли уже конфиги у пользователя
-            existing_configs = await crud.get_user_configs(session, user.id)
-
-            if not existing_configs:
-                # Создаем первый конфиг для пользователя
-                config_number = 1
-                config_name = f"user_{user_id}_{config_number}"
-
-                # Создаем конфиг в админке
-                vless_link = await admin_api.create_user_and_get_config(config_name)
-
-                if vless_link:
-                    # Сохраняем конфиг в БД
-                    paid_until = datetime.now() + timedelta(days=config.SUBSCRIPTION_DAYS)
-
-                    new_config = await crud.create_client_config(
-                        session, user.id, config_number, config_name, vless_link,
-                        is_protected=True, paid_until=paid_until
-                    )
-
-                    await callback.bot.send_message(
-                        user_id,
-                        f"✅ Ваша оплата подтверждена!\n"
-                        f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
-                        f"🔗 Ваш первый конфиг:\n{vless_link}\n\n"
-                        f"📱 Добавьте эту ссылку в ваш VPN-клиент"
-                    )
-                else:
-                    await callback.bot.send_message(
-                        user_id,
-                        f"✅ Ваша оплата подтверждена!\n"
-                        f"Подписка активирована на {config.SUBSCRIPTION_DAYS} дней.\n\n"
-                        f"⚠️ Конфиг будет создан автоматически позже."
-                    )
-            else:
-                # У пользователя уже есть конфиги - просто продлеваем
-                # Разархивируем все конфиги
-                for cfg in existing_configs:
-                    await admin_api.unarchive_user(cfg.config_name)
-
-                await callback.bot.send_message(
-                    user_id,
-                    f"✅ Ваша оплата подтверждена!\n"
-                    f"Подписка продлена на {config.SUBSCRIPTION_DAYS} дней.\n\n"
-                    f"📱 Ваши конфиги снова активны.\n\n"
-                    f"Спасибо за покупку!"
-                )
-
-            await callback.answer("✅ Оплата подтверждена!", show_alert=True)
-
-@router.callback_query(F.data.startswith("reject_payment_"))
-async def reject_payment(callback: CallbackQuery):
-    """Отклонение оплаты"""
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("⛔ У вас нет прав", show_alert=True)
-        return
-
-    user_id = int(callback.data.split("_")[2])
-
-    async with callback.bot.get_db_session() as session:
-        user = await crud.get_user_by_telegram_id(session, user_id)
-        if user:
-            # Находим последний платеж и обновляем статус
-            payment = await crud.get_last_pending_payment(session, user.id)
-            if payment:
-                await crud.update_payment_status(session, payment.id, "rejected")
-
-        await callback.answer("❌ Оплата отклонена", show_alert=True)
-        await callback.message.edit_reply_markup(reply_markup=None)
-
-        await callback.bot.send_message(
-            user_id,
-            "❌ Ваша оплата не подтверждена.\n"
-            "Пожалуйста, свяжитесь с администратором для уточнения деталей."
-        )
-
-@router.callback_query(F.data.startswith("extend_"))
-async def extend_payment_selected(callback: CallbackQuery, state: FSMContext):
-    """Выбрано количество месяцев для продления"""
-    parts = callback.data.split("_")
-    months = int(parts[1])
-    amount = None
-    if len(parts) > 2 and parts[2].isdigit():
-        amount = int(parts[2])
-
-    async with callback.bot.get_db_session() as session:
-        user = await crud.get_user_by_telegram_id(session, callback.from_user.id)
-        if not user:
-            await callback.answer("❌ Пользователь не найден", show_alert=True)
-            return
-
-        # Получаем месячную цену если не передана
-        if not amount:
-            monthly_price = await crud.calculate_monthly_price(session, user.id)
-            if months == 1:
-                amount = monthly_price
-            elif months == 3:
-                amount = int(monthly_price * 3 * 0.95)
-            elif months == 6:
-                amount = int(monthly_price * 6 * 0.9)
-            elif months == 12:
-                amount = int(monthly_price * 12 * 0.85)
-            else:
-                amount = monthly_price * months
-
-        await state.update_data(
-            extend_months=months,
-            extend_amount=amount,
-            is_extend=True,
-            payment_type="extend"  # <-- ДОБАВИТЬ ЭТУ СТРОКУ!
-        )
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-    # Отправляем информацию об оплате с кнопкой "Я оплатил(а)"
-    await callback.message.answer(
-        f"✅ Вы выбрали продление на {format_months(months)}.\n"
-        f"💰 Сумма к оплате: {format_price(amount)}\n\n"
-        f"💳 Реквизиты для оплаты:\n"
-        f"Карта: {config.CARD_NUMBER}\n"
-        f"Получатель: {config.CARD_HOLDER}\n\n"
-        f"❗️ После оплаты нажмите кнопку 'Я оплатил(а)'",
-        reply_markup=get_payment_keyboard()
+    await message.answer(
+        "📊 <b>Статистика</b>\n\n"
+        f"Пользователей: {total_users}\n"
+        f"Активных подписок: {active}\n"
+        f"Просрочено: {expired}\n"
+        f"Активных конфигов: {configs}\n"
+        f"Ожидают подтверждения: {pending}\n"
+        f"Принято оплат всего: {format_price(revenue)}",
+        parse_mode="HTML",
     )
 
-    await callback.answer()
 
-
-@router.callback_query(F.data.startswith("confirm_extend_"))
-async def confirm_extend_payment(callback: CallbackQuery):
-    """Подтверждение оплаты продления"""
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("⛔ У вас нет прав", show_alert=True)
+@router.message(Command("user"))
+async def user_info(message: Message):
+    if not await require_admin(message):
         return
 
-    parts = callback.data.split("_")
-    user_id = int(parts[2])
-    months = int(parts[3])
-    amount = int(parts[4])
+    args, error = get_args(
+        message, min_args=1, usage="❌ Использование: /user [telegram_id]"
+    )
+    if error:
+        await message.answer(error)
+        return
 
-    async with callback.bot.get_db_session() as session:
-        user = await crud.get_user_by_telegram_id(session, user_id)
+    tg_id = int(args[0])
+
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, tg_id)
         if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
+            await message.answer(f"❌ Пользователь {tg_id} не найден")
             return
 
-        # Находим последний платеж
-        payment = await crud.get_last_pending_payment(session, user.id)
-        if payment:
-            await crud.update_payment_status(session, payment.id, "completed")
-
-        # Продлеваем подписку на количество месяцев
-        await crud.extend_subscription_months(session, user.id, months)
-
-        # Продлеваем paid_until для всех конфигов
-        await crud.extend_all_configs_paid_until(session, user.id, months)
-
-        # Получаем все конфиги пользователя
+        sub = await crud.get_user_subscription(session, user.id)
         configs = await crud.get_user_configs(session, user.id)
+        pendings = await crud.get_pending_payments(session, user.id)
 
-        for cfg in configs:
-            await admin_api.unarchive_user(cfg.config_name)
+    state = "активна" if crud.is_active(sub) else "не активна"
+    sub_text = (
+        f"{state}, до {config.format_dt(sub.next_payment)}" if sub else "нет подписки"
+    )
 
-        await callback.answer(f"✅ Оплата на {format_months(months, with_number=False)} подтверждена!", show_alert=True)
-
-        # Удаляем клавиатуру
-        await callback.message.edit_reply_markup(reply_markup=None)
-
-        # Уведомляем пользователя
-        if configs:
-            # Отправляем информацию о продлении
-            await callback.bot.send_message(
-                user_id,
-                f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка продлена на {format_months(months, with_number=True)}.\n\n"
-            )
-        else:
-            await callback.bot.send_message(
-                user_id,
-                f"✅ Ваша оплата подтверждена!\n"
-                f"Подписка продлена на {format_months(months, with_number=True)}.\n\n"
-                f"Спасибо за покупку!"
-            )
-
-#API
-
-@router.message(Command("create_config"))
-async def create_user_config(message: Message):
-    """Создать конфиг для пользователя (только админ)"""
-    if not await require_admin(message):
-        return
-
-    args, error = get_args(message, min_args=2, usage="❌ Использование: /create_config [user_id]\nПример: /create_config 123456789")
-    if error:
-        await message.answer(error)
-        return
-
-    try:
-        telegram_id = int(args[0])
-        username = f"user_{telegram_id}"
-
-        async with message.bot.get_db_session() as session:
-            user = await crud.get_user_by_telegram_id(session, telegram_id)
-            if not user:
-                await message.answer(f"❌ Пользователь {telegram_id} не найден в БД бота")
-                return
-
-        # Получаем конфиг (создаем если нет)
-        await message.answer(f"🔄 Получаю конфиг для пользователя {telegram_id}...")
-
-        vless_link = await admin_api.get_or_create_user_config(username)
-
-        safe_link = html.escape(vless_link)
-
-        if vless_link:
-            # Отправляем конфиг пользователю
-            await message.bot.send_message(
-                telegram_id,
-                f"✅ Ваш конфиг готов!\n\n"
-                f"🔗 VLESS ссылка:\n<code>{safe_link}</code>\n\n"
-                f"📱 Для установки:\n"
-                f"1. Скачайте Happ\n"
-                f"2. Нажмите 'Импорт из буфера обмена'\n"
-                f"3. Вставьте ссылку",
-                parse_mode="HTML"
-            )
-
-            await message.answer(f"✅ Конфиг отправлен пользователю {telegram_id}")
-        else:
-            await message.answer(f"❌ Не удалось получить конфиг для {telegram_id}. Проверьте доступность админки.")
-
-    except ValueError:
-        await message.answer("❌ Неверный формат ID")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-@router.message(Command("get_vless"))
-async def get_vless_link(message: Message):
-    """Получить VLESS ссылку пользователя (только админ)"""
-    if not await require_admin(message):
-        return
-
-    args, error = get_args(message, min_args=2, usage="❌ Использование: /get_vless [user_id]\nПример: /get_vless 123456789")
-    if error:
-        await message.answer(error)
-        return
-
-    try:
-        telegram_id = int(args[0])
-        username = f"user_{telegram_id}"
-
-        vless_link = await admin_api.get_vless_link(username)
-
-        if vless_link:
-            await message.answer(
-                f"🔗 VLESS ссылка для {telegram_id}:\n\n"
-                f"`{vless_link}`",
-                parse_mode="Markdown"
-            )
-        else:
-            await message.answer(f"❌ Пользователь {telegram_id} не найден в админке или конфиг не создан")
-
-    except ValueError:
-        await message.answer("❌ Неверный формат ID")
-
-
-@router.message(Command("delete_config"))
-async def delete_user_config(message: Message):
-    """Удалить конфиг пользователя (только админ)"""
-    if not await require_admin(message):
-        return
-
-    args, error = get_args(message, min_args=2, usage="❌ Использование: /delete_config [user_id]\nПример: /delete_config 123456789")
-    if error:
-        await message.answer(error)
-        return
-
-    try:
-        telegram_id = int(args[0])
-        username = f"user_{telegram_id}"
-
-        success = await admin_api.delete_user(username)
-
-        if success:
-            await message.answer(f"✅ Конфиг для пользователя {telegram_id} удален из админки")
-
-            # Уведомляем пользователя
-            await message.bot.send_message(
-                telegram_id,
-                f"⚠️ Ваш конфиг был удален администратором.\n"
-                f"Для получения нового конфига обратитесь к администратору."
-            )
-        else:
-            await message.answer(f"❌ Не удалось удалить конфиг для {telegram_id}")
-
-    except ValueError:
-        await message.answer("❌ Неверный формат ID")
+    await message.answer(
+        f"👤 <b>{user.username and f'@{user.username}' or tg_id}</b>\n\n"
+        f"Подписка: {sub_text}\n"
+        f"Конфигов: {len(configs)}"
+        + ("\n• " + "\n• ".join(f"#{c.config_number} до {config.format_dt(c.paid_until)}" for c in configs) if configs else "")
+        + (f"\n\n⏳ Неподтверждённых платежей: {len(pendings)}" if pendings else ""),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("admin_status"))
 async def admin_status(message: Message):
-    """Проверить статус админки"""
     if not await require_admin(message):
         return
 
-    is_healthy = await admin_api.health_check()
-
-    if is_healthy:
+    if await admin_api.health_check():
         await message.answer("✅ Админка доступна")
     else:
         await message.answer("❌ Админка недоступна. Проверьте сервер.")
 
 
-@router.message(Command("sync_user"))
-async def sync_user_to_admin(message: Message):
-    """Синхронизировать пользователя из БД бота в админку"""
+@router.message(Command("check_reminders"))
+async def check_reminders_now(message: Message):
     if not await require_admin(message):
         return
 
-    args, error = get_args(message, min_args=2, usage="❌ Использование: /sync_user [user_id]\nПример: /sync_user 123456789")
+    from bot.reminder import check_and_send_reminders
+
+    await message.answer("🔄 Проверяю напоминания...")
+    try:
+        sent = await check_and_send_reminders(message.bot, message.bot.session_maker)
+        await message.answer(f"✅ Готово. Отправлено уведомлений: {sent}")
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(Command("reset_reminder"))
+async def reset_reminder(message: Message):
+    if not await require_admin(message):
+        return
+
+    args, error = get_args(
+        message, min_args=1, usage="❌ Использование: /reset_reminder [telegram_id]"
+    )
     if error:
         await message.answer(error)
         return
 
-    try:
-        telegram_id = int(args[0])
-        username = f"user_{telegram_id}"
+    tg_id = int(args[0])
 
-        async with message.bot.get_db_session() as session:
-            user = await crud.get_user_by_telegram_id(session, telegram_id)
-            if not user:
-                await message.answer(f"❌ Пользователь {telegram_id} не найден в БД бота")
-                return
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, tg_id)
+        if not user:
+            await message.answer(f"❌ Пользователь {tg_id} не найден")
+            return
+        sub = await crud.get_user_subscription(session, user.id)
+        if not sub:
+            await message.answer("❌ У пользователя нет подписки")
+            return
+        await crud.reset_reminder_flags(session, sub.id)
 
-            has_subscription = await crud.check_subscription_status(session, user.id)
+    await message.answer("✅ Флаги напоминаний сброшены")
 
-        # Создаем пользователя в админке
-        success = await admin_api.create_user(username)
 
-        if success:
-            await message.answer(
-                f"✅ Пользователь {telegram_id} синхронизирован с админкой\n"
-                f"Подписка активна: {'да' if has_subscription else 'нет'}"
-            )
-        else:
-            await message.answer(f"❌ Не удалось синхронизировать пользователя {telegram_id}")
-
-    except ValueError:
-        await message.answer("❌ Неверный формат ID")
-
-#Тесты
-
-@router.message(Command("check_reminders"))
-async def check_reminders_now(message: Message):
-    """Принудительная проверка напоминаний (только админ)"""
+@router.message(Command("set_payment_date"))
+async def set_payment_date(message: Message):
+    """Подвинуть дату заморозки — для тестов и ручных разборов."""
     if not await require_admin(message):
         return
 
-    await message.answer("🔄 Проверяю напоминания...")
+    args, error = get_args(
+        message,
+        min_args=2,
+        usage=(
+            "❌ Использование: /set_payment_date [telegram_id] [дней]\n"
+            "Положительное число — отодвинуть в будущее, отрицательное — в прошлое."
+        ),
+    )
+    if error:
+        await message.answer(error)
+        return
 
-    # Импортируем функцию проверки
-    from bot.reminder import check_and_send_reminders
+    tg_id = int(args[0])
+    days = int(args[1])
 
-    try:
-        await check_and_send_reminders(message.bot)
-        await message.answer("✅ Проверка напоминаний выполнена!")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, tg_id)
+        if not user:
+            await message.answer(f"❌ Пользователь {tg_id} не найден")
+            return
+        sub = await crud.get_user_subscription(session, user.id)
+        if not sub:
+            await message.answer("❌ У пользователя нет подписки")
+            return
 
-@router.message(Command("reset_reminder"))
-async def reset_reminder_flag(message: Message):
-    """Сбросить флаг напоминания для тестирования"""
+        sub.next_payment = utcnow() + timedelta(days=days)
+        sub.status = "active"
+        await session.commit()
+
+        await crud.reset_reminder_flags(session, sub.id)
+
+        configs = await crud.get_user_configs(session, user.id)
+        for cfg in configs:
+            cfg.paid_until = sub.next_payment
+        await session.commit()
+
+    await message.answer(
+        f"✅ Новая дата заморозки: {config.format_dt(sub.next_payment, with_time=True)}\n"
+        f"Обновлено конфигов: {len(configs)}"
+    )
+
+
+@router.message(Command("unblock"))
+async def unblock_user(message: Message):
+    """Разблокировать конфиги в админке вручную."""
     if not await require_admin(message):
         return
 
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Использование: /reset_reminder [telegram_id]\n"
-            "Пример: /reset_reminder 123456789"
+    args, error = get_args(
+        message,
+        min_args=1,
+        usage="❌ Использование: /unblock [telegram_id] — разблокирует все конфиги",
+    )
+    if error:
+        await message.answer(error)
+        return
+
+    tg_id = int(args[0])
+
+    async with message.bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, tg_id)
+        if not user:
+            await message.answer(f"❌ Пользователь {tg_id} не найден")
+            return
+        configs = await crud.get_user_configs(session, user.id)
+        names = [c.config_name for c in configs]
+
+    done, failed = [], []
+    for name in names:
+        try:
+            await admin_api.unarchive_user(name)
+            done.append(name)
+        except AdminAPIError as e:
+            failed.append(f"{name}: {e}")
+
+    await message.answer(
+        f"✅ Разблокировано: {len(done)}\n" + (f"❌ Ошибки: {'; '.join(failed)}" if failed else "")
+    )
+
+
+@router.message(Command("sync"))
+async def sync_with_admin(message: Message):
+    """Сверить рассинхрон между ботом и админкой."""
+    if not await require_admin(message):
+        return
+
+    from bot.db.models import ClientConfig
+    from sqlalchemy import select
+
+    async with message.bot.get_db_session() as session:
+        bot_names = set(
+            (
+                await session.execute(
+                    select(ClientConfig.config_name).where(ClientConfig.is_active.is_(True))
+                )
+            ).scalars().all()
         )
-        return
+        try:
+            admin_users = await admin_api.get_all_users()
+        except AdminAPIError as e:
+            await message.answer(f"❌ Админка недоступна: {e}")
+            return
 
-    try:
-        telegram_id = int(parts[1])
+    admin_map = {u.get("name"): u for u in admin_users}
+    only_admin = sorted(set(admin_map) - bot_names)
+    only_bot = sorted(bot_names - set(admin_map))
 
-        async with message.bot.get_db_session() as session:
-            user = await crud.get_user_by_telegram_id(session, telegram_id)
-            if not user:
-                await message.answer(f"❌ Пользователь {telegram_id} не найден")
-                return
+    lines = ["🔄 <b>Сверка</b>\n"]
+    lines.append(f"В боте: {len(bot_names)}, в админке: {len(admin_map)}\n")
+    if only_bot:
+        lines.append("Есть в боте, нет в админке:\n" + "\n".join(f"• {n}" for n in only_bot))
+    if only_admin:
+        lines.append("\nЕсть в админке, нет в боте:\n" + "\n".join(f"• {n}" for n in only_admin))
+    if not only_bot and not only_admin:
+        lines.append("✅ Расхождений нет")
 
-            subscription = await crud.get_user_subscription(session, user.id)
-            if not subscription:
-                await message.answer("❌ У пользователя нет подписки")
-                return
-
-            await crud.reset_reminder_flag(session, subscription.id)
-
-            await message.answer(
-                f"✅ Флаг напоминания сброшен для пользователя {telegram_id}\n"
-                f"Следующее напоминание будет отправлено {subscription.next_payment.strftime('%d.%m.%Y')}"
-            )
-
-    except ValueError:
-        await message.answer("❌ Неверный формат ID")
+    await message.answer("\n".join(lines), parse_mode="HTML")

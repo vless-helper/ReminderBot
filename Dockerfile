@@ -1,21 +1,19 @@
-# Dockerfile
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Устанавливаем зависимости
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
 COPY bot/ ./bot/
+COPY init_db.py update_payment_date.py ./
 
-# Создаем директорию для базы данных
-RUN mkdir -p /app/data
-
-# Переменные окружения
 ENV PYTHONPATH=/app
 ENV TZ=Europe/Moscow
 
-# Команда по умолчанию (запуск бота)
+# Бот и цикл напоминаний живут в одном процессе (bot.main)
 CMD ["python", "-m", "bot.main"]
