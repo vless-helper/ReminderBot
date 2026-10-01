@@ -57,13 +57,17 @@ async def _apply_payment_to_user(session, payment, bot) -> str:
             await crud.extend_subscription_months(session, user_id, months)
             days = config.days_for_months(months)
             await crud.extend_all_configs_paid_until(session, user_id, days)
-        else:
+        elif payment.type == "subscription":
             # Первая подписка
-            sub = await crud.reactivate_subscription(session, user_id, config.SUBSCRIPTION_DAYS)
+            await crud.reactivate_subscription(session, user_id, config.SUBSCRIPTION_DAYS)
             existing = await crud.get_user_configs(session, user_id)
             if not existing:
                 number = payment.config_number or 1
                 name = f"user_{await _tg_id(session, user_id)}_{number}"
+        # new_config подписку НЕ трогает: докупка конфига не продлевает период.
+        # Раньше сюда попадал любой не-extend тип и вызывался
+        # reactivate_subscription, из-за чего каждая докупка добавляла к подписке
+        # ещё SUBSCRIPTION_DAYS. Срок нового конфига берётся из конца подписки ниже.
 
         await crud.mark_effect_applied(session, payment.id)
 
@@ -72,6 +76,9 @@ async def _apply_payment_to_user(session, payment, bot) -> str:
         number = payment.config_number or 1
         name = f"user_{await _tg_id(session, user_id)}_{number}"
         cfg = await crud.get_config_by_name(session, name)
+        # Для только что созданного конфига cfg ещё None, поэтому срок держим
+        # отдельно — иначе в сообщении показывалось «Оплачен до: —».
+        paid_until = cfg.paid_until if cfg else None
 
         if cfg and cfg.vless_link:
             vless_link = cfg.vless_link
@@ -83,9 +90,12 @@ async def _apply_payment_to_user(session, payment, bot) -> str:
                 cfg.vless_link = vless_link
                 await session.commit()
             else:
-                days_left = await crud.days_left(session, user_id)
-                paid_until = utcnow() + timedelta(
-                    days=days_left if days_left > 0 else config.SUBSCRIPTION_DAYS
+                # Докупленный конфиг оплачен ровно до конца текущей подписки.
+                sub = await crud.get_user_subscription(session, user_id)
+                paid_until = (
+                    sub.next_payment
+                    if sub and sub.next_payment > utcnow()
+                    else utcnow() + timedelta(days=config.SUBSCRIPTION_DAYS)
                 )
                 await crud.create_client_config(
                     session, user_id, number, name, vless_link,
@@ -95,7 +105,7 @@ async def _apply_payment_to_user(session, payment, bot) -> str:
         return (
             f"✅ <b>Конфиг #{number} создан</b>\n\n"
             f"🔗 <code>{vless_link}</code>\n\n"
-            f"Оплачен до: {config.format_dt(cfg.paid_until) if cfg else '—'}\n\n"
+            f"Оплачен до: {config.format_dt(paid_until) if paid_until else '—'}\n\n"
             f"Ссылка продублирована в разделе «Мои конфиги»."
         )
 

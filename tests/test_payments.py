@@ -15,7 +15,9 @@ from bot.db.models import Payment
 from bot.handlers import admin as admin_handlers
 from bot.handlers import user as user_handlers
 from bot.utils.pricing import subscription_price
-from tests.fakes import FakeCallbackQuery, FakeMessage, FakeState, FakeUser
+from tests.fakes import (
+    BOT_USER, FakeCallbackQuery, FakeMessage, FakeState, FakeUser,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -33,7 +35,8 @@ async def _start(bot, user):
 
 
 def _press(bot, user, data):
-    msg = FakeMessage(bot, user)
+    """Нажатие кнопки: сообщение с кнопками отправил бот, нажал клиент."""
+    msg = FakeMessage(bot, BOT_USER, chat_id=user.id)
     return FakeCallbackQuery(bot, user, data, msg)
 
 
@@ -363,7 +366,7 @@ async def test_failed_payment_can_be_retried_without_double_extend(bot, db, admi
     admin_api.fail_on.add("set_archived")
     await user_handlers.extend_subscription(FakeMessage(bot, alice, "🔄 Продлить подписку"))
     await user_handlers.extend_period_selected(
-        FakeCallbackQuery(bot, alice, "extend:1", FakeMessage(bot, alice))
+        FakeCallbackQuery(bot, alice, "extend:1", FakeMessage(bot, BOT_USER, chat_id=alice.id))
     )
 
     async with bot.get_db_session() as session:
@@ -491,7 +494,7 @@ async def test_concurrent_extend_does_not_double_period(bot, db, admin_api, user
 
     await user_handlers.extend_subscription(FakeMessage(bot, alice, "🔄 Продлить подписку"))
     await user_handlers.extend_period_selected(
-        FakeCallbackQuery(bot, alice, "extend:1", FakeMessage(bot, alice))
+        FakeCallbackQuery(bot, alice, "extend:1", FakeMessage(bot, BOT_USER, chat_id=alice.id))
     )
     async with bot.get_db_session() as session:
         user = await crud.get_user_by_telegram_id(session, alice.id)
@@ -509,3 +512,136 @@ async def test_concurrent_extend_does_not_double_period(bot, db, admin_api, user
 
     delta = (sub.next_payment - before).days
     assert 28 <= delta <= 31, f"продлено на {delta} дней вместо ~30 — оплата задвоена"
+
+
+# --- Докупка конфига не должна продлевать подписку ---
+
+
+async def _buy_extra_config(bot, db, admin_api, payer, admin):
+    """Полный цикл докупки конфига: кнопка -> «Я оплатил» -> подтверждение админом."""
+    await _register(bot, db, payer)
+
+    # 1. Пользователь жмёт «Докупить конфиг»
+    await user_handlers.buy_extra_config(_press(bot, payer, "cfgnew"))
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, payer.id)
+        pending = await crud.get_pending_payments(session, user.id)
+    assert pending, "ожидался неподтверждённый платёж на докупку"
+
+    payment = pending[0]
+    assert payment.type == "new_config"
+
+    # 2. «Я оплатил»
+    await user_handlers.payment_confirmed(_press(bot, payer, f"pay:{payment.id}"))
+
+    # 3. Админ подтверждает
+    await admin_handlers.confirm_payment(_press(bot, admin, f"ok:{payment.id}"))
+
+    async with bot.get_db_session() as session:
+        return await crud.get_payment(session, payment.id)
+
+
+async def test_new_config_does_not_extend_subscription(bot, db, admin_api, users):
+    """Докупка конфига НЕ продлевает срок подписки.
+
+    Старый код вёл new_config в ту же ветку, что и первую подписку, и вызывал
+    reactivate_subscription(SUBSCRIPTION_DAYS). Из-за этого покупка второго
+    конфига добавляла к подписке ещё 30 дней: месячная подписка с двумя
+    конфигами превращалась в двухмесячную.
+    """
+    alice, admin = users["alice"], users["admin"]
+
+    await _pay_and_confirm(bot, db, admin_api, alice, admin, "subscription")
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        before = (await crud.get_user_subscription(session, user.id)).next_payment
+
+    await _buy_extra_config(bot, db, admin_api, alice, admin)
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        after_sub = await crud.get_user_subscription(session, user.id)
+        configs = await crud.get_user_configs(session, user.id)
+
+    assert len(configs) == 2, "должно быть 2 конфига"
+    assert after_sub.next_payment == before, (
+        f"докупка конфига не должна двигать конец подписки: "
+        f"было {before}, стало {after_sub.next_payment}"
+    )
+
+
+async def test_new_config_paid_until_matches_subscription_end(bot, db, admin_api, users):
+    """Докупленный конфиг оплачен ровно до конца подписки.
+
+    Срок считается по подписке, а не заново от текущего момента: иначе конфиг
+    жил бы дольше, чем оплаченная подписка.
+    """
+    alice, admin = users["alice"], users["admin"]
+
+    await _pay_and_confirm(bot, db, admin_api, alice, admin, "subscription")
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        sub_end = (await crud.get_user_subscription(session, user.id)).next_payment
+
+    await _buy_extra_config(bot, db, admin_api, alice, admin)
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        configs = await crud.get_user_configs(session, user.id)
+
+    extra = next(c for c in configs if c.config_number == 2)
+    assert extra.paid_until is not None, "у докупленного конфига должен быть срок"
+    assert extra.paid_until == sub_end, (
+        f"срок конфига должен совпадать с концом подписки: "
+        f"{extra.paid_until} != {sub_end}"
+    )
+
+
+async def test_renewal_after_cancelling_config_is_cheaper(bot, db, admin_api, users):
+    """Отмена одного конфига из двух делает следующее продление дешевле.
+
+    Клиент оплатил два конфига на месяц, через время отменил один — продление
+    должно считаться от числа активных конфигов, то есть дешевле.
+    """
+    alice, admin = users["alice"], users["admin"]
+
+    await _pay_and_confirm(bot, db, admin_api, alice, admin, "subscription")
+    await _buy_extra_config(bot, db, admin_api, alice, admin)
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        assert await crud.get_active_configs_count(session, user.id) == 2
+
+    # Продление при двух конфигах
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        configs = await crud.get_user_configs(session, user.id)
+        extra_id = next(c.id for c in configs if c.config_number == 2)
+    await user_handlers.delete_config(_press(bot, alice, f"del:{extra_id}"))
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        active = await crud.get_active_configs_count(session, user.id)
+    assert active == 1, "после отмены должен остаться один активный конфиг"
+
+    # Продление при одном конфиге
+    await user_handlers.extend_period_selected(_press(bot, alice, "extend:1"))
+
+    async with bot.get_db_session() as session:
+        user = await crud.get_user_by_telegram_id(session, alice.id)
+        pending = await crud.get_pending_payments(session, user.id)
+
+    assert len(pending) == 1
+    charged = pending[0].amount
+    expected = subscription_price(1, 1).total
+
+    assert charged == expected, (
+        f"после отмены конфига продление должно стоить {expected}, "
+        f"а не {charged} (как за два конфига)"
+    )
+    assert charged < subscription_price(1, 2).total, (
+        "продление после отмены должно быть дешевле, чем за два конфига"
+    )

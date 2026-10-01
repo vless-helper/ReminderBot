@@ -30,6 +30,13 @@ class Sent:
     parse_mode: Optional[str] = None
 
 
+# Автор сообщений, которые бот отправляет сам. В Telegram у такого сообщения
+# from_user — бот, и читать оттуда telegram_id клиента нельзя: хендлер будет
+# искать в БД самого бота. Фейки ниже повторяют это устройство.
+BOT_USER = FakeUser(id=999999999, username="reminder_bot", first_name="ReminderBot",
+                    full_name="ReminderBot")
+
+
 class FakeBot:
     """Пишет все исходящие сообщения в список — их можно проверять."""
 
@@ -67,12 +74,23 @@ class FakeBot:
 
 
 class FakeMessage:
-    def __init__(self, bot: FakeBot, from_user: FakeUser, text: str = "", message_id: int = 0):
+    """Сообщение.
+
+    from_user — кто его ОТПРАВИЛ. У сообщений с инлайн-кнопками это бот,
+    а чат остаётся клиентским. Для сообщений, написанных клиентом,
+    передавай его самого.
+    """
+
+    def __init__(self, bot: FakeBot, from_user: FakeUser, text: str = "",
+                 message_id: int = 0, chat_id: Optional[int] = None):
         self.bot = bot
         self.from_user = from_user
         self.text = text
         self.message_id = message_id
-        self.chat = type("Chat", (), {"id": from_user.id, "type": "private"})()
+        # Ответ уходит в чат, а не автору: у сообщения бота from_user — бот,
+        # но переписка идёт с клиентом.
+        self.chat = type("Chat", (), {"id": chat_id or from_user.id,
+                                      "type": "private"})()
         self.date = None
         self.reply_markup = None
         self.deleted = False
@@ -80,7 +98,7 @@ class FakeMessage:
 
     async def answer(self, text, reply_markup=None, parse_mode=None, **kwargs):
         self.reply_markup = reply_markup
-        return await self.bot.send_message(self.from_user.id, text, reply_markup, parse_mode)
+        return await self.bot.send_message(self.chat.id, text, reply_markup, parse_mode)
 
     async def edit_reply_markup(self, reply_markup=None, **kwargs):
         self.reply_markup = reply_markup
@@ -88,7 +106,7 @@ class FakeMessage:
     async def edit_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
         self.text = text
         self.edits.append(text)
-        return await self.bot.send_message(self.from_user.id, text, reply_markup, parse_mode)
+        return await self.bot.send_message(self.chat.id, text, reply_markup, parse_mode)
 
     async def delete(self):
         self.deleted = True
@@ -105,6 +123,14 @@ class FakeMessage:
 
 
 class FakeCallbackQuery:
+    """Нажатие кнопки: from_user — нажавший, message — сообщение бота с кнопками.
+
+    Правильное устройство вызова:
+        FakeCallbackQuery(bot, client, "extend:1", FakeMessage(bot, BOT_USER))
+    Если передать сообщение, написанное клиентом, тест перестанет замечать
+    баги вида «хендлер взял message.from_user вместо нажавшего».
+    """
+
     def __init__(self, bot: FakeBot, from_user: FakeUser, data: str, message: FakeMessage):
         self.bot = bot
         self.from_user = from_user
@@ -116,11 +142,11 @@ class FakeCallbackQuery:
         self.answers.append((text, show_alert))
 
     async def edit_reply_markup(self, reply_markup=None, **kwargs):
-        self.message._reply_markup = reply_markup
+        self.message.reply_markup = reply_markup
 
     async def edit_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
         self.message.text = text
-        return await self.bot.send_message(self.from_user.id, text, reply_markup, parse_mode)
+        return await self.bot.send_message(self.message.chat.id, text, reply_markup, parse_mode)
 
 
 class FakeState:

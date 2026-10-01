@@ -44,15 +44,21 @@ class QuestionState(StatesGroup):
     waiting_for_question = State()
 
 
-async def _require_user(message: Message, session):
+async def _require_user(telegram_id: int, reply_to: Message, session):
     """Достать пользователя по telegram_id. None -> отправлен ответ в /start.
+
+    telegram_id передаётся отдельно и намеренно первым: у inline-кнопок
+    нельзя брать callback.message.from_user — там лежит БОТ, потому что
+    сообщение с клавиатурой отправил он. Нажавшего лежит в callback.from_user.
+    Из-за путаницы клиент получал «пользователь не найден» на кнопках
+    продления и докупки конфига.
 
     Возвращаем объект User, потому что все crud-функции ждут внутренний
     user_id, а не telegram_id.
     """
-    user = await crud.get_user_by_telegram_id(session, message.from_user.id)
+    user = await crud.get_user_by_telegram_id(session, telegram_id)
     if not user:
-        await message.answer("❌ Пользователь не найден. Отправьте /start")
+        await reply_to.answer("❌ Пользователь не найден. Отправьте /start")
     return user
 
 
@@ -104,7 +110,7 @@ async def block_buttons_during_question(message: Message):
 @router.message(F.text == "📦 Купить подписку", ~StateFilter(QuestionState.waiting_for_question))
 async def buy_subscription(message: Message):
     async with message.bot.get_db_session() as session:
-        user = await _require_user(message, session)
+        user = await _require_user(message.from_user.id, message, session)
         if not user:
             return
 
@@ -150,7 +156,7 @@ async def buy_subscription(message: Message):
 @router.message(F.text == "🔄 Продлить подписку", ~StateFilter(QuestionState.waiting_for_question))
 async def extend_subscription(message: Message):
     async with message.bot.get_db_session() as session:
-        user = await _require_user(message, session)
+        user = await _require_user(message.from_user.id, message, session)
         if not user:
             return
 
@@ -189,7 +195,7 @@ async def extend_subscription(message: Message):
 @router.message(F.text == "ℹ️ Моя подписка", ~StateFilter(QuestionState.waiting_for_question))
 async def check_subscription(message: Message):
     async with message.bot.get_db_session() as session:
-        user = await _require_user(message, session)
+        user = await _require_user(message.from_user.id, message, session)
         if not user:
             return
 
@@ -237,7 +243,7 @@ async def extend_period_selected(callback: CallbackQuery):
         return
 
     async with callback.bot.get_db_session() as session:
-        user = await _require_user(callback.message, session)
+        user = await _require_user(callback.from_user.id, callback.message, session)
         if not user:
             return
 
@@ -328,7 +334,7 @@ async def _user_pk(session, telegram_id: int) -> int:
 @router.message(F.text == "📱 Мои конфиги", ~StateFilter(QuestionState.waiting_for_question))
 async def my_configs(message: Message):
     async with message.bot.get_db_session() as session:
-        user = await _require_user(message, session)
+        user = await _require_user(message.from_user.id, message, session)
         if not user:
             return
 
@@ -361,7 +367,7 @@ async def buy_extra_config(callback: CallbackQuery):
     await callback.answer()
 
     async with callback.bot.get_db_session() as session:
-        user = await _require_user(callback.message, session)
+        user = await _require_user(callback.from_user.id, callback.message, session)
         if not user:
             return
 
@@ -530,7 +536,7 @@ async def delete_config(callback: CallbackQuery):
 # --- Вопросы ---
 
 
-@router.message(F.text == "❓ Задать вопрос", ~StateFilter(None))
+@router.message(F.text == "❓ Задать вопрос", ~StateFilter(QuestionState.waiting_for_question))
 async def ask_question(message: Message, state: FSMContext):
     await state.set_state(QuestionState.waiting_for_question)
     await message.answer(
@@ -586,3 +592,26 @@ async def close_message(callback: CallbackQuery):
         await callback.message.delete()
     except Exception:  # noqa: BLE001
         await callback.message.edit_reply_markup(reply_markup=None)
+
+
+# --- Ловушка для всего, что не нашлось выше ---
+
+
+@router.callback_query()
+async def unknown_callback(callback: CallbackQuery):
+    """Молчание — худший вариант: клиент не понимает, что нажал, и мы не знаем почему.
+
+    Ловим незнакомый callback_data и пишем его в лог, чтобы чинить по факту.
+    """
+    logger.warning(
+        "Неизвестный callback %r от %s (чат %s)",
+        callback.data, callback.from_user.id, callback.message.chat.id,
+    )
+    await callback.answer("Кнопка устарела. Откройте /start и попробуйте снова.", show_alert=True)
+
+
+@router.message()
+async def unknown_message(message: Message):
+    logger.warning(
+        "Неизвестное сообщение %r от %s", message.text, message.from_user.id
+    )

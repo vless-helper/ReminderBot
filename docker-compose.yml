@@ -1,39 +1,154 @@
+# Образы закреплены по ID, а не по тегу.
+#
+# Раньше везде стояло :latest, и это уже стоило нам инцидента: sing-box
+# пересобирает latest на каждый коммит, поэтому «latest» на момент запуска и
+# «latest» в реестре — разные образы (проверено: конфиг-дайджест в реестре
+# fb81c40c, а работает 9bed1fcb). Тег v1.13.11 тоже не подходит: он собран
+# иначе и даёт другой config-digest.
+#
+# Следствие: `docker compose pull` для закреплённых сервисов не работает.
+# Обновление — только явно:
+#   docker pull ghcr.io/sagernet/sing-box:latest
+#   docker inspect -f '{{.Image}}' <новый контейнер>   # подставить новый ID
+# и обновить image в этом файле, после чего `docker compose up -d`.
+x-logging: &logging
+  driver: json-file
+  options:
+    # 10 файлов по 10 МБ на сервис. Без этого логи растут без ограничения
+    # и рано или поздно съедают диск.
+    max-size: "10m"
+    max-file: "10"
+
 services:
   db:
-    image: postgres:16-alpine
+    # PostgreSQL 16.15
+    image: sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     container_name: reminder-bot-db
     restart: unless-stopped
+    logging: *logging
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-reminderbot}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-reminderbot}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 12
     # Порт наружу не публикуем: к базе ходит только бот
     expose:
       - "5432"
 
+  # Перезапускает sing-box после изменения списка клиентов. Без него
+  # менеджер отвечает 500 на любое создание/блокировку.
+  reloader:
+    image: sha256:a71e7980da989d05b06ee8507f8c55630d164cbf5de2aee592c07d8a396f87c1
+    container_name: reminder-sing-box-reloader
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      LISTEN_ADDR: ":8080"
+      SING_BOX_CONTAINER: "reminder-sing-box"
+      RESTART_TIMEOUT_SECONDS: "10"
+      RELOAD_TOKEN: ${RELOADER_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8080"
+
+  sing-box:
+    # sing-box 1.13.11
+    image: sha256:9bed1fcb406bd971d1b48c7f824e5128d63543ca278cdcd6b5737c19941e404d
+    container_name: reminder-sing-box
+    restart: unless-stopped
+    logging: *logging
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes:
+      - ./config:/etc/sing-box
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "443:443"
+
+  vless-manager:
+    build:
+      context: ./manager
+    container_name: reminder-vless-manager
+    restart: unless-stopped
+    logging: *logging
+    env_file:
+      - manager.env
+    environment:
+      API_PORT: "8080"
+      SERVER_JSON_NAME: /app/state/config.json
+      CLIENTS_JSON_NAME: /app/state/clients.json
+    # Монтируем каталог, а не отдельные файлы: менеджер пишет JSON через
+    # «записать во временный файл + переименовать», а rename поверх
+    # bind-mounted файла на Linux падает с EBUSY.
+    volumes:
+      - ./config:/app/state
+    depends_on:
+      reloader:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
   bot:
-    build: .
+    build:
+      context: ./app
     container_name: reminder-bot
     restart: unless-stopped
+    logging: *logging
     env_file:
-      - ${BOT_ENV_FILE:-.env}
+      - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-reminderbot}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     depends_on:
       db:
         condition: service_healthy
+      vless-manager:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-m", "bot.healthcheck"]
       interval: 30s
       timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Гасит просроченные подписки независимо от бота: нужны только БД и
+  # админка. Без него падение контейнера бота оставляло бы клиентов
+  # с работающим VPN.
+  expiry-watchdog:
+    build:
+      context: ./app
+    container_name: reminder-expiry-watchdog
+    restart: unless-stopped
+    logging: *logging
+    command: ["python", "-m", "bot.expiry_watchdog"]
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      WATCHDOG_INTERVAL: "300"
+    depends_on:
+      db:
+        condition: service_healthy
+      vless-manager:
+        condition: service_started
+    healthcheck:
+      # Проверяем heartbeat, а не наличие процесса: так ловится и смерть
+      # сторожа, и цикл, который перестал гасить просрочку. pgrep в образе нет.
+      test: ["CMD", "python", "-m", "bot.expiry_watchdog", "--health"]
+      interval: 60s
+      timeout: 15s
       retries: 3
       start_period: 20s
 

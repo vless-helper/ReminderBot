@@ -18,6 +18,7 @@ from aiogram import Bot
 from bot.api.client import AdminAPIError, admin_api
 from bot.config import config, utcnow
 from bot.db import crud
+from bot.keyboards.keyboards import get_extend_keyboard
 from bot.utils.helpers import format_price
 from bot.utils.pricing import monthly_price
 
@@ -41,7 +42,7 @@ def _plural_days(n: int) -> str:
     return "дней"
 
 
-async def _send_upcoming(bot: Bot, sub, days_before: int) -> bool:
+async def _send_upcoming(bot: Bot, sub, days_before: int, configs_count: int) -> bool:
     """Напоминание «скоро заморозка». Текст зависит от числа дней."""
     days_left = max(0, (sub.next_payment - utcnow()).days)
 
@@ -61,7 +62,8 @@ async def _send_upcoming(bot: Bot, sub, days_before: int) -> bool:
             f"{header}\n\n"
             f"Дата заморозки: {config.format_dt(sub.next_payment)}\n\n"
             f"{body}\n"
-            f"Кнопка «Продлить подписку».",
+            f"Выберите срок продления ниже.",
+            reply_markup=get_extend_keyboard(configs_count),
         )
         return True
     except Exception as e:  # noqa: BLE001
@@ -144,7 +146,8 @@ async def check_and_send_reminders(bot: Bot, session_maker=None) -> int:
             if in_reminder_window():
                 for days_before in sorted(config.REMINDER_DAYS_BEFORE, reverse=True):
                     for sub in await crud.get_due_reminder_subscriptions(session, days_before):
-                        if await _send_upcoming(bot, sub, days_before):
+                        configs_count = await crud.get_active_configs_count(session, sub.user_id)
+                        if await _send_upcoming(bot, sub, days_before, configs_count):
                             await crud.mark_reminder_sent(session, sub.id, days_before)
                             sent += 1
 

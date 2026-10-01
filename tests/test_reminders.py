@@ -12,6 +12,7 @@ import pytest
 
 from bot.config import utcnow
 from bot.db import crud
+from bot import reminder as reminder_mod
 from bot.reminder import check_and_send_reminders
 from tests.fakes import FakeUser
 
@@ -138,7 +139,7 @@ async def test_payment_after_expiry_unblocks(bot, db, admin_api, users):
     """Оплата после просрочки разблокирует конфиги."""
     from bot.handlers import admin as admin_handlers
     from bot.handlers import user as user_handlers
-    from tests.fakes import FakeCallbackQuery, FakeMessage
+    from tests.fakes import BOT_USER, FakeCallbackQuery, FakeMessage
 
     alice, admin = users["alice"], users["admin"]
     u = await _make_user(bot, alice.id, "alice")
@@ -154,11 +155,11 @@ async def test_payment_after_expiry_unblocks(bot, db, admin_api, users):
     assert any("заморожена" in m.text for m in bot.messages_to(alice.id)), "ожидалось сообщение о заморозке"
 
     bot.clear()
-    await user_handlers.extend_period_selected(FakeCallbackQuery(bot, alice, "extend:1", FakeMessage(bot, alice)))
+    await user_handlers.extend_period_selected(FakeCallbackQuery(bot, alice, "extend:1", FakeMessage(bot, BOT_USER, chat_id=alice.id)))
     async with bot.get_db_session() as session:
         payment = (await crud.get_pending_payments(session, u.id))[0]
 
-    msg = FakeMessage(bot, alice)
+    msg = FakeMessage(bot, BOT_USER, chat_id=alice.id)
     await user_handlers.payment_confirmed(FakeCallbackQuery(bot, alice, f"pay:{payment.id}", msg))
     await admin_handlers.confirm_payment(FakeCallbackQuery(bot, admin, f"ok:{payment.id}", msg))
 
@@ -181,7 +182,7 @@ async def test_payment_after_expiry_unblocks(bot, db, admin_api, users):
 async def test_archived_user_cannot_get_link(bot, db, admin_api, users):
     """Заблокированный пользователь не должен получать ссылку."""
     from bot.handlers import user as user_handlers
-    from tests.fakes import FakeCallbackQuery, FakeMessage
+    from tests.fakes import BOT_USER, FakeCallbackQuery, FakeMessage
 
     alice = users["alice"]
     u = await _make_user(bot, alice.id, "alice")
@@ -191,7 +192,7 @@ async def test_archived_user_cannot_get_link(bot, db, admin_api, users):
     await check_and_send_reminders(bot, db)
 
     bot.clear()
-    cb = FakeCallbackQuery(bot, alice, f"link:{cfg.id}", FakeMessage(bot, alice))
+    cb = FakeCallbackQuery(bot, alice, f"link:{cfg.id}", FakeMessage(bot, BOT_USER, chat_id=alice.id))
     await user_handlers.show_config_link(cb)
 
     texts = [m.text for m in bot.messages_to(alice.id)]
@@ -239,3 +240,38 @@ async def test_timezone_awareness(bot, db, admin_api, users):
 
     async with bot.get_db_session() as session:
         assert await crud.days_left(session, u.id) == 9 or await crud.days_left(session, u.id) == 10
+
+
+async def test_reminder_has_extend_buttons(bot, db, admin_api, users, monkeypatch):
+    """Напоминание должно приходить с кнопками выбора срока продления.
+
+    Раньше текст заканчивался висячим «Кнопка «Продлить подписку».», но
+    reply_markup не передавался вовсе — клиенту приходилось самому искать
+    кнопку в меню.
+    """
+    monkeypatch.setattr(reminder_mod, "in_reminder_window", lambda: True)
+
+    alice = users["alice"]
+    user = await _make_user(bot, alice.id, "alice")
+    await _set_deadline(bot, user.id, 3)
+
+    await check_and_send_reminders(bot, db)
+
+    msg = bot.last_to(alice.id)
+    assert msg is not None, "напоминание должно быть отправлено"
+
+    assert "<b>Скоро заморозка подписки</b>" in msg.text
+    assert "Кнопка «Продлить подписку»." not in msg.text, (
+        "висячая фраза без кнопки осталась в тексте"
+    )
+    assert "Выберите срок продления ниже." in msg.text
+
+    assert msg.reply_markup is not None, "к напоминанию должна прилагаться клавиатура"
+    flat = [
+        btn.callback_data
+        for row in msg.reply_markup.inline_keyboard
+        for btn in row
+    ]
+    assert any(cb and cb.startswith("extend:") for cb in flat), (
+        f"в клавиатуре нет кнопок продления: {flat}"
+    )
