@@ -12,6 +12,7 @@ REMINDER_DAYS_BEFORE без правок кода.
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot
 
@@ -23,6 +24,18 @@ from bot.utils.helpers import format_price
 from bot.utils.pricing import monthly_price
 
 logger = logging.getLogger(__name__)
+
+# Heartbeat для монитора. В общем томе state, а не в /tmp: монитор живёт в
+# другом контейнере и своего /tmp у него не видно.
+BOT_HEARTBEAT_PATH = os.environ.get("BOT_HEARTBEAT", "/state/bot_heartbeat")
+
+
+def touch_heartbeat() -> None:
+    try:
+        with open(BOT_HEARTBEAT_PATH, "w") as f:
+            f.write(str(int(utcnow().timestamp())))
+    except OSError as e:  # pragma: no cover
+        logger.warning("Не удалось обновить heartbeat: %s", e)
 
 
 def in_reminder_window() -> bool:
@@ -177,6 +190,10 @@ async def reminder_loop(bot: Bot, session_maker):
     while True:
         try:
             await check_and_send_reminders(bot, session_maker)
+            # Монитор читает этот файл, чтобы отличить «процесс жив» от
+            # «цикл реально работает». Без него зависший цикл выглядит
+            # здоровым: процесс есть, порт открыт, healthcheck зелёный.
+            touch_heartbeat()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

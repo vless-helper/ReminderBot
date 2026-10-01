@@ -57,6 +57,18 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8080"
+    healthcheck:
+      # Слушает ли он свой порт. Своего /health у reloader нет — все маршруты
+      # отдают 404, — поэтому проверяем сам факт LISTEN в /proc/net/tcp.
+      # Без этого поломка reloader'а молча ломала выдачу конфигов: менеджер
+      # отвечает 500, бот падает, а статус контейнера остаётся «Up».
+      test:
+        - CMD-SHELL
+        - grep -q ':1F90 .*0A' /proc/net/tcp /proc/net/tcp6 || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   sing-box:
     # sing-box 1.13.11
@@ -71,6 +83,18 @@ services:
       - NET_ADMIN
     ports:
       - "443:443"
+    healthcheck:
+      # Две проверки: конфиг остаётся валидным и порт действительно слушается.
+      # Валидность конфига важна отдельно: битый конфиг не роняет уже
+      # запущенный sing-box, а следующий перезапуск reloader'а его уронит —
+      # и без этой проверки VPN выглядел бы живым до самого рестарта.
+      test:
+        - CMD-SHELL
+        - sing-box check -c /etc/sing-box/config.json && grep -q ':01BB .*0A' /proc/net/tcp /proc/net/tcp6
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   vless-manager:
     build:
@@ -110,6 +134,9 @@ services:
     environment:
       TZ: ${TZ:-Europe/Moscow}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      BOT_HEARTBEAT: /state/bot_heartbeat
+    volumes:
+      - state:/state
     depends_on:
       db:
         condition: service_healthy
@@ -138,6 +165,9 @@ services:
       TZ: ${TZ:-Europe/Moscow}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       WATCHDOG_INTERVAL: "300"
+      WATCHDOG_HEARTBEAT: /state/watchdog_heartbeat
+    volumes:
+      - state:/state
     depends_on:
       db:
         condition: service_healthy
@@ -152,7 +182,44 @@ services:
       retries: 3
       start_period: 20s
 
+  # Проверяет, что сервисы живы, и пишет админу при поломке. Отдельный
+  # сервис, а не часть сторожа: поломка мониторинга не должна гасить
+  # просрочку, и наоборот. Telegram нужен только для отправки алерта —
+  # апдейты он не слушает, поэтому падение бота не мешает сообщить о нём.
+  monitor:
+    build:
+      context: ./app
+    container_name: reminder-monitor
+    restart: unless-stopped
+    logging: *logging
+    command: ["python", "-m", "bot.monitor"]
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      MONITOR_INTERVAL: "120"
+      MONITOR_STATE_DIR: /state
+      MONITOR_PING_URL: ${MONITOR_PING_URL:-}
+    volumes:
+      - state:/state
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # Heartbeat, а не наличие процесса: иначе зависший цикл выглядит живым.
+      test: ["CMD", "python", "-m", "bot.monitor", "--health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+
 volumes:
   db_data:
     driver: local
     name: reminder-bot-db-data
+  # Общий том для heartbeat-файлов бота, сторожа и монитора: это разные
+  # контейнеры, и в своём /tmp они видят только себя.
+  state:
+    driver: local
+    name: reminder-bot-state
