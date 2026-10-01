@@ -27,12 +27,19 @@
 
 Про VPN и сеть. Проверка vpn_port идёт по внутренней сети Docker, поэтому
 она НЕ видит, что сломалось на хосте: файрвол, провайдер или публикация
-порта. Снаружи 443 открыт, но изнутри мы проверим только то, что сервис
-принимает соединения. Открытый порт на хосте проверяет внешний сторож
-(healthchecks.io) — оба слоя нужны, каждый ловит то, чего не видит другой.
+порта. Для этого наружу отдаётся /healthz (см. _serve_healthz): внешний
+сторож (Cronitor) дёргает его снаружи, поэтому сервер, который мы видим
+изнутри, проверяется ещё и настоящим внешним клиентом.
+
+Схема двух слоёв. Внутренний (этот сервис) знает про детали и умеет
+рассказать, что именно сломалось. Внешний (Cronitor) ничего не знает
+про наши контейнеры, зато видит, жив ли сервер вообще — включая случай,
+когда Docker или хост лежат и внутренний монитор уже не может сказать
+ничего. Молчание внешнего — тоже авария, поэтому у него есть свой таймер.
 """
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -80,6 +87,14 @@ MEM_MIN_AVAIL_MB = int(os.environ.get("MONITOR_MEM_MIN_AVAIL_MB", "128"))
 # Хранилище состояния нужно между проходами: без него «упало -> восстановилось
 # -> упало» за последние сутки даст три сообщения, и алерт станет шумом.
 STATE_PATH = os.environ.get("MONITOR_STATE", "/tmp/monitor_state.json")
+
+# Порт /healthz для внешнего сторожа (Cronitor). Снаружи открывается только
+# он: без секретов и без возможности что-то изменить.
+HEALTH_PORT = int(os.environ.get("MONITOR_HEALTH_PORT", "8099"))
+HEALTH_PATH = "/healthz"
+
+# Результат последнего прохода для /healthz. Обновляется циклом проверок.
+_LAST: dict = {}
 
 
 @dataclass
@@ -365,6 +380,77 @@ async def ping_external(url: str) -> bool:
         return False
 
 
+# --- /healthz для внешнего сторожа ------------------------------------------
+
+
+async def _serve_healthz() -> Optional[asyncio.AbstractServer]:
+    """Отдаёт наружу результат последней проверки. Только чтение, без секретов.
+
+    Наружу смотрит не то, «жив ли контейнер», а то, «жив ли стек», потому что
+    иначе эндпоинт был бы просто копией docker healthcheck и не дал бы
+    Cronitor узнать про упавший VPN или БД.
+    """
+    def _reply(path: str) -> tuple[int, bytes]:
+        """Считаем ответ на каждый запрос, а не один раз при старте.
+
+        Иначе застывший «ok» годами показывал бы, что всё хорошо, даже
+        если сломки были уже месяц назад.
+        """
+        if path != HEALTH_PATH:
+            return 404, b'{"status":"not found"}'
+        if _LAST.get("checked_at") is None:
+            # Первый проход ещё не завершён: честно «не знаю», а не «здоров».
+            return 503, b'{"status":"starting"}'
+        broken = (_LAST.get("result") or {}).get("broken") or []
+        if broken:
+            payload = {"status": "degraded", "broken": broken}
+            return 503, json.dumps(payload).encode()
+        return 200, b'{"status":"ok"}'
+
+    class Handler(asyncio.Protocol):
+        def connection_made(self, transport) -> None:
+            self.transport = transport
+
+        def data_received(self, data: bytes) -> None:
+            request = data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            parts = request.split(" ")
+            method = parts[0] if parts else ""
+            target = parts[1] if len(parts) > 1 else ""
+            path = target.split("?", 1)[0]
+
+            # Не-GET/HEAD наружу не отвечаем вовсе: эндпоинту нечего менять,
+            # а лишние методы — лишняя поверхность для сканеров.
+            if method not in ("GET", "HEAD"):
+                status, raw = 405, b'{"status":"method not allowed"}'
+            else:
+                status, raw = _reply(path)
+
+            reason = {
+                200: "OK",
+                404: "Not Found",
+                405: "Method Not Allowed",
+                503: "Service Unavailable",
+            }[status]
+            head = (
+                f"HTTP/1.1 {status} {reason}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(raw)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            self.transport.write(head if method == "HEAD" else head + raw)
+            self.transport.close()
+
+    try:
+        return await asyncio.get_event_loop().create_server(
+            Handler, "0.0.0.0", HEALTH_PORT, reuse_address=True
+        )
+    except OSError as e:  # pragma: no cover
+        # Не поднимаем из-за этого весь монитор: внутренние проверки и
+        # оповещения в Telegram важнее, чем доступность эндпоинта.
+        logger.error("Не удалось открыть порт %s для /healthz: %s", HEALTH_PORT, e)
+        return None
+
+
 async def main() -> int:
     engine, session_maker = create_engine_and_session(config.DATABASE_URL)
     touch_heartbeat()
@@ -383,6 +469,10 @@ async def main() -> int:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:  # pragma: no cover
             pass
+
+    health_server = await _serve_healthz()
+    if health_server is not None:
+        logger.info("/healthz слушает порт %s для внешнего сторожа", HEALTH_PORT)
 
     try:
         while not stop.is_set():
@@ -415,6 +505,12 @@ async def main() -> int:
                 else:
                     logger.info("Все проверки пройдены")
 
+                # Пишем снимок для /healthz только после того, как разослали
+                # оповещения: иначе наружу уехал бы «здоров», а админ об
+                # аварии ещё не узнал.
+                _LAST["result"] = {"broken": broken_names}
+                _LAST["checked_at"] = time.time()
+
                 if await ping_external(os.environ.get("MONITOR_PING_URL", "")):
                     touch_heartbeat()
 
@@ -430,6 +526,9 @@ async def main() -> int:
             except asyncio.TimeoutError:
                 continue
     finally:
+        if health_server is not None:
+            health_server.close()
+            await health_server.wait_closed()
         await engine.dispose()
         logger.info("Монитор остановлен")
 

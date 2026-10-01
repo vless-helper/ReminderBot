@@ -6,6 +6,7 @@
 завалить сообщениями одно и то же.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -285,3 +286,144 @@ def test_warning_checks_are_not_critical():
 def test_all_checks_have_titles():
     for name in m.ORDER:
         assert m.Check(name, False).title != name, f"нет человеческого названия у {name}"
+
+
+# --- /healthz для внешнего сторожа ------------------------------------------
+
+
+async def _request(monkeypatch, snap, checked_at=1.0, path="/healthz"):
+    """Поднимает эндпоинт на свободном порту и делает реальный HTTP-запрос.
+
+    Проверяем настоящим сокетом, а не вызовом функции: внешний сторож
+    приходит по TCP, и ошибка в заголовке или в закрытии соединения там
+    выглядит как «сервер мёртв» — то есть как ложная тревога.
+    """
+    monkeypatch.setitem(m._LAST, "result", snap)
+    if checked_at is None:
+        m._LAST.pop("checked_at", None)
+    else:
+        m._LAST["checked_at"] = checked_at
+
+    monkeypatch.setattr(m, "HEALTH_PORT", 0)
+    server = await m._serve_healthz()
+    assert server is not None
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = int(head.split()[1])
+    return status, json.loads(body)
+
+
+@pytest.fixture(autouse=True)
+def _clean_last():
+    """_LAST — общее состояние модуля: сброс, иначе тест видит чужой проход."""
+    m._LAST.clear()
+    yield
+    m._LAST.clear()
+
+
+async def test_healthz_ok_when_everything_healthy(monkeypatch):
+    status, body = await _request(monkeypatch, {"broken": []})
+    assert status == 200
+    assert body == {"status": "ok"}
+
+
+async def test_healthz_503_lists_broken_checks(monkeypatch):
+    """Внешний сторой должен видеть, ЧТО сломалось, а не только что «плохо»."""
+    status, body = await _request(monkeypatch, {"broken": ["vpn_port", "db"]})
+    assert status == 503
+    assert body["status"] == "degraded"
+    assert body["broken"] == ["vpn_port", "db"]
+
+
+async def test_healthz_503_before_first_pass(monkeypatch):
+    """До первого прохода честно отвечаем «не знаю», а не «здоров».
+
+    Иначе в первые секунды после старта или перезапуска внешний сторож увидит
+    200 и решит, что всё в порядке, хотя проверок ещё не было.
+    """
+    status, body = await _request(monkeypatch, None, checked_at=None)
+    assert status == 503
+    assert body["status"] == "starting"
+
+
+async def test_healthz_body_carries_no_secrets(monkeypatch):
+    """Наружу отдаётся только список имён проверок."""
+    _status, body = await _request(monkeypatch, {"broken": ["db"]})
+    text = json.dumps(body).lower()
+    for secret in ("token", "password", "secret", "admin_id", "database_url"):
+        assert secret not in text
+
+
+async def test_healthz_404_on_other_paths(monkeypatch):
+    """Наружу торчит один эндпоинт, а не мини-веб-сервер."""
+    status, _body = await _request(monkeypatch, {"broken": []}, path="/admin")
+    assert status == 404
+
+
+async def test_healthz_rejects_non_read_methods(monkeypatch):
+    """Эндпоинту нечего менять, поэтому POST наружу не принимается."""
+    monkeypatch.setitem(m._LAST, "result", {"broken": []})
+    monkeypatch.setitem(m._LAST, "checked_at", 1.0)
+    monkeypatch.setattr(m, "HEALTH_PORT", 0)
+    server = await m._serve_healthz()
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"POST /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert int(raw.split()[1]) == 405
+
+
+async def test_healthz_follows_state_changes_without_restart(monkeypatch):
+    """Ответ считается на каждый запрос, а не запекается при старте сервера.
+
+    Регрессия: если бы статус и тело вычислялись один раз, застывший «ok»
+    показывал бы здоровое состояние спустя любое время после поломки.
+    """
+    monkeypatch.setattr(m, "HEALTH_PORT", 0)
+    server = await m._serve_healthz()
+    port = server.sockets[0].getsockname()[1]
+
+    async def _get():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+        return int(raw.split()[1])
+
+    try:
+        m._LAST.clear()
+        assert await _get() == 503, "до первого прохода"
+
+        m._LAST["result"] = {"broken": []}
+        m._LAST["checked_at"] = time.time()
+        assert await _get() == 200, "всё здоровo"
+
+        m._LAST["result"] = {"broken": ["vpn_port"]}
+        assert await _get() == 503, "VPN упал на живом сервере"
+
+        m._LAST["result"] = {"broken": []}
+        assert await _get() == 200, "VPN починили"
+    finally:
+        server.close()
+        await server.wait_closed()
+

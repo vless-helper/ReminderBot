@@ -201,6 +201,12 @@ services:
       MONITOR_INTERVAL: "120"
       MONITOR_STATE_DIR: /state
       MONITOR_PING_URL: ${MONITOR_PING_URL:-}
+      MONITOR_HEALTH_PORT: "8099"
+    ports:
+      # Наружу отдаётся только /healthz — для внешнего сторожа (Cronitor).
+      # Ответ содержит лишь список сломанных проверок: ни секретов, ни
+      # управления. Запросы, отличные от /healthz, отвечаются как 404.
+      - "8099:8099"
     volumes:
       - state:/state
     depends_on:
